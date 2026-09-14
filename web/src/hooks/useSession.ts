@@ -25,6 +25,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AgentEvent, ConversationState, SessionDeleted, SessionMode, SessionSummary } from '../types';
 import { listSessions, getSessionEvents, startSession, startSessionErrorDetail, streamSession, cancelSession, recoverSession, sendMessage as apiSendMessage, changeSessionModel, forkSession, deleteSession, archiveSession, unarchiveSession, NotFoundError, RecoverError, SessionError, type SendMessagePayload, type StartSessionPayload } from '../lib/api';
 import { consumeSSE, type SSEHandle } from '../lib/sse';
+import { wsStreamResponse, discoverNewSessionId, sessionIdBaseline } from '../lib/wsStream';
 import { initConversation, applyEvent, projectHistory, deriveSessionTitle, extractSessionTitle } from '../lib/projection';
 import { MAX_RECONNECT_ATTEMPTS, RECONNECT_BANNER_DELAY_MS, RECONNECT_STALL_MS, ReconnectController } from '../lib/reconnect';
 import { RUN_TERMINAL_TYPES, hasUnterminatedRun, unpairedToolCallIds } from '../lib/runState';
@@ -227,6 +228,14 @@ export function isUnknownModelError(message: string | null | undefined): boolean
  *  后端 detail 不是契约文本（Pydantic 校验与 HTTPException 的形状也不同），
  *  所以不做子串区分，统一提示「刷新选项后重试」。 */
 export const CONTINUE_PARAMS_ERROR_TEXT = '续聊参数无效（422）：请刷新选项后重试';
+
+/** 「立即失败 vs 正常流式」的判别窗口（毫秒）。
+ *
+ *  起因是交付层攒包：正常流式的响应头会被压到 run 结束才下发，而 4xx/422 是
+ *  **完整且极短**的响应，会立刻到达。给一个短窗：窗内返回 = 真失败（要读 detail）；
+ *  窗外才返回 = 正常流式，改走 WebSocket 接流（见 lib/wsStream.ts 的实测数据）。
+ *  取 1200ms：足够覆盖本地/沙箱直连时的正常往返，又不至于让用户多等。 */
+export const EARLY_RESPONSE_WINDOW_MS = 1200;
 
 export function useSession() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -716,16 +725,34 @@ export function useSession() {
       const gen = streamGenRef.current;
       setMode({ kind: 'live', sessionId: null });
       try {
-        const res = await startSession(payload);
-        // 422 的旧语义：Composer 唯一的 422 来源是"模型不可用"，App 据这句话刷新
-        // 模型目录 —— 保持逐字节不变。确认面（ownError）里 422 更可能是 cwd 校验
-        // 失败，必须让后端 detail 说话（它才是可行动的那句）。
-        if (res.status === 422 && !opts?.ownError) throw new Error(UNKNOWN_MODEL_ERROR_TEXT);
-        if (!res.ok || !res.body) {
-          const detail = await startSessionErrorDetail(res);
-          throw new Error(detail || `Start failed: ${res.status}`);
+        // 交付层（EdgeOne / CloudStudio Gateway）会把整个 SSE 响应攒到**流结束**
+        // 才下发（实测 `POST /api/sessions` 的响应头要 44.2s 才到 ≈ run 全长），
+        // 于是 `await startSession(...)` 在 run 跑完前不 resolve——前端只可能在答案
+        // 答完之后才拿到第一帧，打字机效果不可能出现。
+        // 对策：先取会话 id 基线 → 发出 POST 但**不 await** → 只有「短窗内就返回」
+        // 才当成立即失败（422/4xx 是非流式，会立刻到）→ 否则认领新会话，改用
+        // WebSocket 接流（同一交付链路上实测逐帧到达，见 lib/wsStream.ts）。
+        const baseline = await sessionIdBaseline();
+        const started = startSession(payload);
+        const res = await Promise.race([
+          started,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), EARLY_RESPONSE_WINDOW_MS)),
+        ]);
+        if (res) {
+          // 422 的旧语义：Composer 唯一的 422 来源是"模型不可用"，App 据这句话刷新
+          // 模型目录 —— 保持逐字节不变。确认面（ownError）里 422 更可能是 cwd 校验
+          // 失败，必须让后端 detail 说话（它才是可行动的那句）。
+          if (res.status === 422 && !opts?.ownError) throw new Error(UNKNOWN_MODEL_ERROR_TEXT);
+          if (!res.ok || !res.body) {
+            const detail = await startSessionErrorDetail(res);
+            throw new Error(detail || `Start failed: ${res.status}`);
+          }
+          attachLiveStream(res, gen, null);
+          return null;
         }
-        attachLiveStream(res, gen, null);
+        const sid = await discoverNewSessionId(baseline);
+        if (streamGenRef.current !== gen) return '提交已被新的会话取代';
+        attachLiveStream(wsStreamResponse(sid), gen, null);
         return null;
       } catch (e) {
         // 过期请求迟到失败：丢弃，不污染新会话（调用方也不该当成功——返回一句
@@ -787,18 +814,13 @@ export function useSession() {
       const gen = streamGenRef.current;
       setMode({ kind: 'live', sessionId: sid });
       try {
-        const res = await streamSession(sid, afterSeq);
-        if (streamGenRef.current !== gen) return; // 期间切走/取消：丢弃
-        if (res.status === 404) {
-          // 会话在装载与接流之间消失。这里**不写** writeStoredSessionId(null)：
-          // 马上要回到 viewing(sid)，持久化 effect 会立刻把 sid 写回去，清了也是
-          // 白清。真正已被删的会话由下面这一步兜住——mode 变更会重跑历史装载，
-          // getSessionEvents 404 → NotFoundError → 清键 + 回 idle，那次落得住。
-          setMode({ kind: 'viewing', sessionId: sid });
-          return;
-        }
-        if (!res.ok || !res.body) throw new Error(`resume ${res.status}`);
-        attachLiveStream(res, gen, initialConv, { resume: true });
+        // 交付层把 `GET /stream` 的响应头也压到 run 结束（实测 41.6s）——原实现
+        // `await streamSession(...)` 会让刷新后的用户在整个 run 期间什么都看不到。
+        // sid 与游标都已知 → 直接走 WS（快照按 afterSeq 只补本地缺的那一截）。
+        // 会话已删的 404 语义由历史装载路径兜住：mode 变更会重跑装载，
+        // `getSessionEvents` 404 → NotFoundError → 清键 + 回 idle（见下方原注释）。
+        if (streamGenRef.current !== gen) return;
+        attachLiveStream(wsStreamResponse(sid, afterSeq), gen, initialConv, { resume: true });
       } catch (e) {
         if (streamGenRef.current !== gen) return;
         // 历史已渲染，这里只报告「继续接收」失败——不把视图打回空态。
@@ -844,12 +866,24 @@ export function useSession() {
       const gen = streamGenRef.current;
       setMode({ kind: 'live', sessionId });
       try {
-        const res = await apiSendMessage(sessionId, {
+        // 同 submitTask：launched 分支的 SSE 响应体会被交付层攥到 run 结束，不能干等。
+        // queued/steered 是 JSON 确认（极短）→ 短窗内必返回；窗外 = launched，
+        // 此时 sid 已知，直接用 WS 接流。
+        const pending = apiSendMessage(sessionId, {
           content,
           mode: 'queue',
           max_steps: opts?.maxSteps ?? 10,
           ...(opts?.amend ?? {}),
         });
+        const res = await Promise.race([
+          pending,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), EARLY_RESPONSE_WINDOW_MS)),
+        ]);
+        if (res === null) {
+          // launched：launched → 直驱新 run，用 WS 消费（同 POST /api/sessions 形状）
+          attachLiveStream(wsStreamResponse(sessionId), gen, conversationRef.current);
+          return;
+        }
         if (res.status === 422) throw new Error(CONTINUE_PARAMS_ERROR_TEXT);
         if (res.status === 409) {
           // T8 #138：409 = 存在需人工裁决的 UNKNOWN Operation。

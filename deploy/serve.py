@@ -243,6 +243,138 @@ def _selftest(t: str = "") -> dict:
     return out
 
 
+@app.get("/__gwprobe")
+def _gwprobe(t: str = "", via: str = "raw", tools: int = 0) -> dict:
+    """**流式诊断**：测同一次流式请求在两层的「攒包度」。
+
+    - `via=raw`（默认）：绕开 langchain/httpx，直接对 MODEL_BASE_URL 发流式请求；
+    - `via=langchain`：走项目真实的 `ModelConfig → create_chat_model → astream` 路径。
+
+    两者对比即可定位攒包发生在哪一层：
+    - raw 逐字、langchain 攒包 → SDK/请求形态的问题；
+    - 两者都逐字、线上 App 仍攒包 → 攒包在 Harness 的事件发射/持久化环节。
+    再加 `tools=1` 带上工具定义（Agent 主链的真实请求形态）。
+
+    只读配置、不落库；令牌门控（会真花钱）。
+    """
+    token = _env_file_value("DEMO_PROBE_TOKEN")
+    if not token or t != token:
+        return {"error": "forbidden"}
+
+    import time
+
+    from agent_harness.config import Settings
+
+    s = Settings()
+    prompt = "请写一段大约一百字的说明，介绍什么是事件溯源。"
+
+    if via == "langchain":
+        import asyncio
+
+        from langchain_core.messages import HumanMessage
+
+        from agent_harness.model.config import ModelConfig
+        from agent_harness.model.provider import create_chat_model
+
+        async def measure() -> dict:
+            model = create_chat_model(ModelConfig.from_settings(s))
+            bound = model
+            if tools:
+                bound = model.bind_tools([{
+                    "type": "function",
+                    "function": {"name": "noop", "description": "noop",
+                                 "parameters": {"type": "object", "properties": {}}},
+                }])
+            t0 = time.time()
+            stamps: list[float] = []
+            async for chunk in bound.astream([HumanMessage(content=prompt)]):
+                # 只记有增量的 chunk（含 reasoning 增量）
+                has = bool(getattr(chunk, "content", "")) or bool(
+                    (getattr(chunk, "additional_kwargs", {}) or {}).get("reasoning_content"))
+                if has:
+                    stamps.append(time.time() - t0)
+            return {"stamps": stamps}
+
+        try:
+            res = asyncio.run(measure())
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "via": via, "error": f"{type(exc).__name__}: {exc}"}
+        stamps = res["stamps"]
+        if not stamps:
+            return {"ok": False, "via": via, "error": "没有增量 chunk"}
+        span = stamps[-1] - stamps[0]
+        return {
+            "ok": True, "via": via, "tools": bool(tools),
+            "chunks": len(stamps), "ttft_s": round(stamps[0], 3),
+            "span_s": round(span, 3),
+            "verdict": ("逐字流式" if span >= 1.0 else
+                        ("攒包" if len(stamps) >= 5 else "帧太少判不准")),
+        }
+
+    import urllib.error
+    import urllib.request
+
+    key = s.model_api_key.get_secret_value()
+    url = (s.model_base_url or "").rstrip("/") + "/chat/completions"
+    payload: dict = {"model": s.model_name,
+                     "messages": [{"role": "user", "content": prompt}],
+                     "max_tokens": 400, "stream": True}
+    if tools:
+        payload["tools"] = [{
+            "type": "function",
+            "function": {"name": "noop", "description": "noop",
+                         "parameters": {"type": "object", "properties": {}}},
+        }]
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json",
+                 # 部分网关按 UA 拦非浏览器客户端（403），带上更稳
+                 "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36")},
+    )
+    t0 = time.time()
+    stamps: list[float] = []
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    stamps.append(time.time() - t0)
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "url": url, "status": exc.code,
+                "body": exc.read(300).decode("utf-8", "replace")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "url": url, "error": f"{type(exc).__name__}: {exc}"}
+
+    if not stamps:
+        return {"ok": False, "url": url, "error": "没有任何内容帧"}
+    span = stamps[-1] - stamps[0]
+    return {
+        "ok": True, "url": url, "model": s.model_name,
+        "ttft_s": round(stamps[0], 3),
+        "chunks": len(stamps),
+        "span_s": round(span, 3),
+        "verdict": ("逐字流式（这一跳没问题）" if span >= 1.0
+                    else ("攒包：响应到齐才交付" if len(stamps) >= 5
+                          else "帧太少，判不准")),
+    }
+
+
 # ── 前端资源：精确子挂载 + 末尾 catch-all（都注册在自检路由之后）──────────
 # 目录在**请求时**解析（见 _resolved_site 注释），所以这里无条件注册，
 # 不受「进程启动早于文件落盘」影响。
