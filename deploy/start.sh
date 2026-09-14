@@ -18,6 +18,10 @@ if [ -z "$PY" ]; then echo "未找到 python 解释器" >&2; exit 1; fi
 # 源码在 src/ 下，直接加进模块搜索路径（无需 pip install 本包）
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 
+# tiktoken 默认首次使用时联网下载 cl100k_base 词表；受限出网环境（如发布沙箱
+# 拦 openaipublic.blob.core.windows.net）会抛 SSLError，导致 ContextBuilder
+# 第一步就失败、run 直接 run/failed。词表已随包携带，这里指向本地缓存目录。
+export TIKTOKEN_CACHE_DIR="$(pwd)/tiktoken_cache"
+
 echo "[start] python=$PY port=${PORT:-8000} cwd=$(pwd)"
-exec "$PY" -m uvicorn agent_harness.web.app:create_prod_app \
-  --factory --host 0.0.0.0 --port "${PORT:-8000}"
+exec "$PY" serve.py
