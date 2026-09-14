@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-12T14:40:00Z",
+  "title": "Design System: Agent Harness Inspector",
+  "extensions": {
+    "colorMeta": {
+      "blossom": { "role": "primary", "displayName": "Pale Blossom", "canonical": "#f1b3ca", "tonalRamp": ["#2a161d", "#4a2431", "#6d3244", "#914258", "#b5536c", "#d76e8c", "#f1b3ca", "#fadbe6"] },
+      "blossom-deep": { "role": "primary", "displayName": "Deep Blossom（亮色主题 accent）", "canonical": "#c96990" },
+      "canvas": { "role": "neutral", "displayName": "Canvas", "canonical": "#0c0c0f" },
+      "chrome": { "role": "neutral", "displayName": "Chrome", "canonical": "#101014" },
+      "workspace": { "role": "neutral", "displayName": "Workspace", "canonical": "#121217" },
+      "elevated": { "role": "neutral", "displayName": "Elevated", "canonical": "#17171d" },
+      "overlay": { "role": "neutral", "displayName": "Overlay", "canonical": "#262b34" },
+      "success": { "role": "secondary", "displayName": "Success Green", "canonical": "#6fce9e" },
+      "warning": { "role": "secondary", "displayName": "Warning Amber", "canonical": "#e3b565" },
+      "danger": { "role": "secondary", "displayName": "Danger Red", "canonical": "#e5726f" },
+      "info": { "role": "secondary", "displayName": "Info Blue", "canonical": "#7c9eff" },
+      "terminal-bg": { "role": "neutral", "displayName": "Terminal Screen", "canonical": "#0d0d0f" }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "空态标题；全 app 唯一 ≥17px 的日常文字。" },
+      "body": { "displayName": "Body", "purpose": "对话正文；max 78ch。" },
+      "label": { "displayName": "Label", "purpose": "可读文本下限 12px（UI-02 起）。" },
+      "data": { "displayName": "Data", "purpose": "命令/ID/seq/时长；tabular-nums 强制。" },
+      "micro-label": { "displayName": "Micro Label", "purpose": "10px 唯一合法形态：全大写 + 0.08em 字距面板眉标。" }
+    },
+    "shadows": [
+      { "name": "overlay", "value": "0 2px 8px rgba(0, 0, 0, 0.25)", "purpose": "低浮层（palette、composer 收起态）；亮色主题 rgba(0,0,0,0.08)。" },
+      { "name": "popover", "value": "0 8px 28px rgba(0, 0, 0, 0.42)", "purpose": "picker/弹窗；亮色主题 rgba(0,0,0,0.14)。两级之外禁止第三级阴影/辉光。" }
+    ],
+    "motion": [
+      { "name": "ease-apple", "value": "cubic-bezier(0.2, 0.8, 0.2, 1)", "purpose": "一切状态过渡的默认缓动。" },
+      { "name": "dur-fast", "value": "150ms", "purpose": "hover/active 即时反馈。" },
+      { "name": "dur-in", "value": "240ms", "purpose": "Inspector 展开/收起。" },
+      { "name": "dur-expand", "value": "180ms", "purpose": "事件内联展开。" },
+      { "name": "dur-pulse", "value": "750ms", "purpose": "选中联动 pulse / 运行呼吸；仅状态表达。" }
+    ],
+    "breakpoints": [
+      { "name": "inspector-collapse", "value": "1200px" },
+      { "name": "control-row-wrap", "value": "820px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Send Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Composer 发送键：32px 圆形，blossom 底深色图标，双环挖空 focus。",
+      "html": "<button class=\"ds-send\" aria-label=\"发送\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"M12 19V5M5 12l7-7 7 7\"/></svg></button>",
+      "css": ".ds-send { width: 32px; height: 32px; border: none; border-radius: 9999px; background: var(--accent, #f1b3ca); color: #0c0c0f; display: grid; place-items: center; cursor: pointer; transition: transform 150ms cubic-bezier(0.2, 0.8, 0.2, 1); } .ds-send:hover { transform: translateY(-1px); } .ds-send:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--surface-overlay, #262b34), 0 0 0 4px color-mix(in srgb, var(--accent, #f1b3ca) 55%, transparent); } .ds-send:active { transform: scale(0.98); }"
+    },
+    {
+      "name": "Approve Button",
+      "kind": "button",
+      "refersTo": "button-approve",
+      "description": "审批卡批准键：success 实底，kbd chip 标注快捷键。",
+      "html": "<button class=\"ds-approve\">✓ 批准 <kbd class=\"ds-kbd\">Ctrl+⏎</kbd></button>",
+      "css": ".ds-approve { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: none; border-radius: 6px; background: var(--success, #6fce9e); color: #0c0c0f; font: 500 13px var(--font-ui, Inter, sans-serif); cursor: pointer; } .ds-approve:disabled { opacity: 0.55; cursor: not-allowed; } .ds-kbd { padding: 1px 5px; border-radius: 4px; background: rgba(0, 0, 0, 0.18); font: 500 10px var(--font-mono, monospace); }"
+    },
+    {
+      "name": "Deny Button",
+      "kind": "button",
+      "refersTo": "button-deny",
+      "description": "审批卡拒绝键：danger 描边幽灵态。",
+      "html": "<button class=\"ds-deny\">✕ 拒绝 <kbd class=\"ds-kbd ds-kbd-ghost\">Ctrl+⌫</kbd></button>",
+      "css": ".ds-deny { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: 1px solid color-mix(in srgb, var(--danger, #e5726f) 45%, transparent); border-radius: 6px; background: transparent; color: var(--danger, #e5726f); font: 500 13px var(--font-ui, Inter, sans-serif); cursor: pointer; } .ds-deny:hover { background: color-mix(in srgb, var(--danger, #e5726f) 10%, transparent); } .ds-kbd-ghost { background: color-mix(in srgb, var(--danger, #e5726f) 12%, transparent); }"
+    },
+    {
+      "name": "Solid Card",
+      "kind": "card",
+      "refersTo": "card-solid",
+      "description": "内联内容卡：实心 elevated + hairline + 8px；禁玻璃禁第三级阴影。",
+      "html": "<div class=\"ds-card\">内联内容卡</div>",
+      "css": ".ds-card { background: var(--surface-1, #17171d); border: 1px solid var(--border-subtle, rgba(255,255,255,0.075)); border-radius: 8px; padding: 12px 16px; color: var(--text-primary, rgba(255,255,255,0.92)); font: 400 14px/1.7 var(--font-ui, Inter, sans-serif); }"
+    },
+    {
+      "name": "Composer Dock",
+      "kind": "input",
+      "refersTo": "composer-dock",
+      "description": "一级浮层输入坞：玻璃材质 + focus-within 双环上浮。",
+      "html": "<div class=\"ds-dock\"><textarea class=\"ds-dock-input\" rows=\"2\" placeholder=\"描述一个任务…\"></textarea></div>",
+      "css": ".ds-dock { background: var(--surface-overlay, #262b34); border: 0.5px solid var(--glass-border, rgba(255,255,255,0.1)); border-radius: 12px; padding: 12px 16px; transition: box-shadow 240ms cubic-bezier(0.2, 0.8, 0.2, 1); } .ds-dock:focus-within { box-shadow: inset 0 0.5px 0 rgba(255,255,255,0.12), 0 0 0 1px color-mix(in srgb, var(--accent, #f1b3ca) 45%, transparent), 0 8px 28px rgba(0,0,0,0.42); } .ds-dock-input { width: 100%; border: none; background: transparent; resize: none; color: var(--text-primary, rgba(255,255,255,0.92)); font: 400 15px/1.5 var(--font-ui, Inter, sans-serif); outline: none; } .ds-dock-input::placeholder { color: var(--text-tertiary, rgba(255,255,255,0.52)); }"
+    },
+    {
+      "name": "Session Item",
+      "kind": "nav",
+      "refersTo": "session-item",
+      "description": "Rail 会话项：三行结构，选中 blossom 8% 染底。",
+      "html": "<div class=\"ds-session ds-session-active\"><div class=\"ds-session-title\">帮我定位测试失败并修复</div><div class=\"ds-session-meta\">15 事件 · 4 小时前</div></div>",
+      "css": ".ds-session { padding: 8px 12px; border-radius: 8px; cursor: pointer; } .ds-session-active { background: var(--surface-selected, rgba(245,174,201,0.08)); } .ds-session-title { font: 500 13px/1.45 var(--font-ui, Inter, sans-serif); color: var(--text-primary, rgba(255,255,255,0.92)); } .ds-session-meta { font: 400 12px/1.5 var(--font-ui, Inter, sans-serif); color: var(--text-tertiary, rgba(255,255,255,0.52)); margin-top: 2px; }"
+    },
+    {
+      "name": "Run Pulse",
+      "kind": "custom",
+      "refersTo": "run-pulse",
+      "description": "签名组件：运行生命体征药丸，icon+色相+文字三通道，思考相呼吸。",
+      "html": "<div class=\"ds-pulse\"><span class=\"ds-pulse-dot ds-pulse-live\"></span>思考中 · 12s</div>",
+      "css": ".ds-pulse { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 9999px; border: 1px solid color-mix(in srgb, var(--accent, #f1b3ca) 30%, transparent); background: color-mix(in srgb, var(--accent, #f1b3ca) 7%, transparent); color: var(--text-primary, rgba(255,255,255,0.92)); font: 500 12px var(--font-ui, Inter, sans-serif); font-variant-numeric: tabular-nums; } .ds-pulse-dot { width: 6px; height: 6px; border-radius: 9999px; background: var(--accent, #f1b3ca); } .ds-pulse-live { animation: ds-breathe 750ms ease-in-out infinite; } @keyframes ds-breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } } @media (prefers-reduced-motion: reduce) { .ds-pulse-live { animation: none; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Observation Instrument（观察仪）",
+    "overview": "暗色优先的 agent 运行观察仪：亮度分层取代阴影分层，密度是自觉选择，唯一的品牌签名是一道克制的淡粉——出现即意味着可交互或状态特殊。浮层用玻璃，内容面用实心；终端块是内容里的另一块屏幕，跨主题恒定。",
+    "keyCharacteristics": [
+      "三栏：Session Rail | Agent Workspace | Run Inspector",
+      "低对比 chrome、高清晰内容，面板靠色调差 + 1px 边分层",
+      "签名组件：Run Pulse 与 Trace Ladder",
+      "动效只表达状态，150-750ms，reduced-motion 全局兜底"
+    ],
+    "rules": [
+      { "name": "The One Voice Rule", "body": "accent 只给交互与状态：hover、selected、focus、主操作、运行状态。禁止给非交互内容当语法高亮，禁止大面积铺陈。", "section": "colors" },
+      { "name": "The 12px Floor Rule", "body": "一切需要阅读的文字 ≥12px；10px 只允许全大写 + 字距的 micro-label。", "section": "typography" },
+      { "name": "The Contrast Floor Rule", "body": "一切可读文本在两个主题下实测 ≥4.5:1。", "section": "colors" },
+      { "name": "The Glass Only Floating Rule", "body": "玻璃与阴影只属于浮层；内联内容面禁止玻璃与第三级阴影。", "section": "elevation" }
+    ],
+    "dos": [
+      "Do 给每个交互面 hover/focus-visible/active/disabled/loading 完整状态",
+      "Do 层级同时动用字号档、字重与透明度三档",
+      "Do 数字一律 mono + tabular-nums",
+      "Do 改暗色 token 时同步亮色块（index.css 双块纪律）"
+    ],
+    "donts": [
+      "Don't 给非交互内容用 accent",
+      "Don't 在内联内容面用玻璃、backdrop blur 或第三级阴影",
+      "Don't 让可读文本低于 12px 或对比度低于 4.5:1（两主题实测）",
+      "Don't 硬编码 ⌘ 快捷键文案；按平台显示",
+      "Don't 直出原始 JSON/转义字符串给用户"
+    ]
+  }
+}

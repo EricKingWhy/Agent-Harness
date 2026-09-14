@@ -1,0 +1,64 @@
+[build-system]
+requires = ["uv_build>=0.8.11,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "intelligence-agent"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "fastapi>=0.115.0",
+    "langchain-core>=1.5.4",
+    "langchain-openai>=1.5.0",
+    "mcp>=2.1.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.10,<3",
+    "python-dotenv>=1.2.2",
+    "sse-starlette>=2.1.0",
+    "tiktoken>=0.7.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+agent-harness = "agent_harness.cli:main"
+
+[project.optional-dependencies]
+artifact = ["aioboto3>=13.0"]
+memory = [
+    "langgraph>=0.6.0",
+    "langmem>=0.0.30,<0.1",
+    "pymilvus>=2.6,<2.7",
+]
+observability = [
+    "langfuse>=3",
+]
+sandbox = [
+    "docker>=7",
+]
+
+[tool.uv.build-backend]
+module-name = "agent_harness"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.3",
+    # demo/live_agent.py 用它做彩色终端渲染；不是运行时依赖。
+    "rich>=13.7.0",
+    "wsproto>=1.3.2",
+]
+
+[tool.pytest.ini_options]
+# 让项目根进入 sys.path，使 tests/ 下的测试辅助模块（如 scripted_model）
+# 能以 tests.xxx 形式被跨文件导入；否则只有 src 在路径上。
+pythonpath = ["."]
+# 集成测试默认不跑（烧 token、依赖真实 LLM）。
+# 手动跑：uv run pytest -m integration
+addopts = ["-m", "not integration and not qiniu"]
+markers = [
+    "integration: 端到端集成测试（需要真实 LLM API key、烧 token）",
+    "qiniu: 七牛云 S3 集成测试（需要真实对象存储凭证）",
+]

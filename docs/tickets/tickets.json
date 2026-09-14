@@ -1,0 +1,1361 @@
+{
+  "fetched_at": "2026-09-04T18:11:17.252915+00:00",
+  "issues": [
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "# Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools\n\n## Problem Statement\n\nAgent 目前只能调用 `add` / `boom` 这类演示工具，无法在隔离工作空间内真正完成 Coding 任务。要让 Agent 真正\"会写代码\"，它必须能读文件、写文件、在受控环境里跑 shell 命令（如 pytest），并基于命令结果继续决策。这些操作必须在一个有明确安全边界的 Sandbox 内执行，而非直接在用户宿主机上裸跑。\n\n## Solution\n\n引入 `Sandbox` 抽象契约（6 个方法：`ensure_started / exec / read_text / write_text / copy_in / stop`），切片 1 同时实现两个后端：`LocalSubprocessSandbox`（本机子进程，开发/测试默认、零外部依赖）和 `DockerSandbox`（生产隔离，基于 docker-py）。在 Sandbox 之上实现三个 Coding Tool（`read` / `write` / `bash`），按现有 `Tool` 契约暴露给模型，接入 AgentRuntime 的 ToolExecutor 执行链。Agent 能在 workspace 内完成\"写测试文件 → 跑 pytest → 读失败 → 给回答\"的真实闭环。\n\n## User Stories\n\n1. 作为 Agent 开发者，我想要一个 Sandbox 抽象层，这样read/write/bash 等Coding Tool 不绑定具体执行环境（本地或 Docker）。\n2. 作为 Agent 开发者，我想要一个 LocalSubprocessSandbox，这样开发和测试时不需要 Docker daemon 也能跑通完整工具链。\n3. 作为 Agent 开发者，我想要一个 DockerSandbox，这样生产环境下 Agent 的命令执行有真正的容器级隔离。\n4. 作为 Agent，我想要一个 read 工具，这样我能读取 workspace 内的文本文件以理解项目现状。\n5. 作为 Agent，我想要一个 write 工具，这样我能覆盖写入文件来创建或修改代码。\n6. 作为 Agent，我想要一个 bash 工具，这样我能在 workspace 内执行 shell 命令（如 pytest、ls、cat）并获得 exit_code / stdout / stderr。\n7. 作为 Agent，当我用 bash 跑 pytest 且测试失败（exit_code=1）时，我希望 ToolResult.ok=True 且 exit_code 在 data 里，这样我能读到 stdout/stderr 自主决定下一步，而不是被 ToolExecutor 当成可重试错误自动重试。\n8. 作为 Agent 开发者，我希望 Sandbox 统一强制 workspace 路径边界，这样即使模型尝试访问 workspace 外的宿主机敏感路径（如 `../../etc/passwd`），也会被拒绝而非静默执行。\n9. 作为 Agent 开发者，我希望默认测试套不依赖 Docker daemon，这样 CI 和本地开发永远绿。\n10. 作为 Agent 开发者，我希望 Docker 真容器测试在 daemon 不可用时自动跳过，这样不影响默认套。\n11. 作为 Agent 开发者，我希望 `docker` 依赖是懒加载的（不进 pyproject.toml 硬依赖），这样只用 LocalSubprocessSandbox 的用户不需要装 docker-py。\n12. 作为 Agent 开发者，我想要一个真实 LLM 驱动的端到端集成测试，这样能验证 Agent 真的能在 sandbox 里完成 Coding 闭环（非剧本驱动的确定性测试）。\n13. 作为 Agent 开发者，我希望集成测试在无 API key 时自动跳过，这样默认套不烧 token、不挂。\n\n## Implementation Decisions\n\n### Sandbox 抽象契约（一次定全 6 方法）\n- `ensure_started() -> None`：惰性启动执行环境（LocalSubprocess 是 no-op；Docker 起容器）。\n- `exec(command: str, *, timeout: float | None = None) -> ExecResult`：执行 shell 命令，返回 `ExecResult(exit_code: int, stdout: str, stderr: str, duration_ms: float)`。\n- `read_text(path: str) -> str`：读 workspace 内文件，返回文本。\n- `write_text(path: str, content: str) -> None`：覆盖写 workspace 内文件。\n- `copy_in(host_path: Path, workspace_path: str) -> None`：把宿主文件拷入 workspace（LocalSubprocess 是复制到 workspace 目录；Docker 是 docker cp）。切片 1 的 LocalSubprocessSandbox 实现该方法；DockerSandbox 实现该方法。\n- `stop() -> None`：清理执行环境（LocalSubprocess 可选清理；Docker 停容器）。\n\n### ExecResult 是 Sandbox 层的原生返回\n- `ExecResult` 是一个 dataclass（`exit_code: int / stdout: str / stderr: str / duration_ms: float`）。\n- Sandbox 不感知 `ToolResult`；bash 工具负责 `ExecResult → ToolResult` 映射。\n\n### 双后端实现\n- `LocalSubprocessSandbox(workspace_root: Path)`：在本机子进程执行命令（`subprocess.run`），workspace_root 是本机一个真实目录。所有路径 resolve 后校验 `is_relative_to(workspace_root)`，越界拒绝。\n- `DockerSandbox(image: str = \"python:3-slim\", workspace: str = \"/workspace\", ...)`：基于 docker-py，惰性 `import docker`。容器挂载 workspace volume，命令通过 `container.exec_run` 执行。\n- 两个后端都实现完整 6 方法契约。\n\n### docker 依赖懒加载\n- `docker` 不进 `pyproject.toml`。\n- `DockerSandbox.__init__` 内 `import docker`，导入失败抛 `RuntimeError(\"DockerSandbox 需要 pip install docker\")`。\n- `LocalSubprocessSandbox` 不触发 docker import。\n\n### workspace 路径边界在 Sandbox 层强制\n- 所有接受路径的方法（`read_text` / `write_text` / `copy_in`）把传入路径 `Path.resolve()` 后校验是否在 workspace 内。\n- 越界抛 `PermissionError` 或返回明确拒绝（由 Tool 层捕获映射成 `ErrorCode.PERMISSION_DENIED`）。\n- Tool 层不做路径校验（单一职责）。\n\n### 三个 Coding Tool 按现有 Tool 契约实现\n- `ReadTool`：`side_effect = READ_ONLY`；`args_schema` 含 `path: str`；execute 调 `sandbox.read_text(path)`，成功返回 `ToolResult.success(data={\"content\": ...})`。\n- `WriteTool`：`side_effect = MUTATING`；`args_schema` 含 `path: str, content: str`；execute 调 `sandbox.write_text(path, content)`，成功返回 `ToolResult.success()`。\n- `BashTool`：`side_effect = MUTATING`（默认 mutating，保守）；`args_schema` 含 `command: str`；execute 调 `sandbox.exec(command)`，**无论 exit_code 几**都返回 `ToolResult.ok=True`，`data = {exit_code, stdout, stderr, duration_ms}`。只有 Sandbox 本身抛异常（如容器崩了）才返回 `ToolResult.failure`。\n\n### bash 非零 exit_code 的语义（ADR-0002）\n- bash 工具的 `ToolResult.ok` 永远 `True`（除非 Sandbox 崩溃）。\n- 非零 exit_code 不是 Tool Runtime 异常，不进 `ErrorCode`，不触发 `ToolExecutor` 重试。\n- `exit_code / stdout / stderr / duration_ms` 在 `ToolResult.data` 里供模型读取。\n\n### Sandbox 与 Tool 的接线\n- Coding Tool 在构造时绑定一个 `Sandbox` 实例（`ReadTool(sandbox=...)`）。\n- AgentRuntime 构造时把 Sandbox 实例注入 Tool 实例，再注册进 ToolRegistry。\n- ToolExecutor 不感知 Sandbox（它只调 `tool.execute(validated_args)`）。\n\n### 新增模块结构\n- `src/agent_harness/sandbox/__init__.py`\n- `src/agent_harness/sandbox/base.py`（`Sandbox` ABC + `ExecResult` dataclass）\n- `src/agent_harness/sandbox/local.py`（`LocalSubprocessSandbox`）\n- `src/agent_harness/sandbox/docker.py`（`DockerSandbox`）\n- `src/agent_harness/tools/__init__.py`\n- `src/agent_harness/tools/read.py`（`ReadTool`）\n- `src/agent_harness/tools/write.py`（`WriteTool`）\n- `src/agent_harness/tools/bash.py`（`BashTool`）\n\n### 模型配置\n- 集成测试使用阿里 qwen 模型，配置走现有 `.env`（MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME）。\n- API key 存 `.env`，不进 git。\n\n## Testing Decisions\n\n### 测试哲学\n只测外部行为，不测实现细节。复用现有测试结构，最高位缝优先。\n\n### 测试缝 1：Sandbox 抽象层（`tests/sandbox/`）\n- 用 `LocalSubprocessSandbox` 跑全部契约测试（零 Docker 依赖）。\n- 测：`exec` 返回正确 `ExecResult`；`read_text` / `write_text` 正常读写；**路径越界拒绝**（核心安全不变量，`../../` escape 测试）；`ensure_started` / `stop` 幂等。\n- 先例：`tests/tooling/test_executor.py` 的\"构造输入 → 调方法 → 断言返回形状\"风格。\n\n### 测试缝 2：Coding Tool 层（`tests/tools/`）\n- 每个 Tool 单独测：参数 schema 校验（非法参数 → `INVALID_ARGUMENT`）；`side_effect` 分类正确；`ExecResult → ToolResult` 映射正确；bash 非零 exit_code 仍是 `ok=True`（ADR-0002 不变量）；read/write 成功路径。\n- 复用现有 `ToolExecutor.execute(tool_call_dict)` 调用方式。\n- 先例：`tests/tooling/test_executor.py`。\n\n### 测试缝 3：AgentRuntime 端到端集成（`tests/agent/test_agent_loop_docker_integration.py`）\n- 真实 qwen LLM + `LocalSubprocessSandbox` + 注册 read/write/bash 的 Registry + ToolExecutor。\n- 验证完整闭环：Agent 收到指令（如\"在 workspace 写一个会失败的 pytest 测试文件，然后跑 pytest\"），真实写文件、真实跑命令、读到 exit_code=1、给最终回答。\n- `@pytest.mark.skipif(无 API key)` 守护，默认套不跑。\n- 先例：`tests/agent/test_agent_loop.py`（但用真实模型替代 ScriptedModel）。\n\n### Docker 真容器测试\n- `tests/sandbox/test_docker_sandbox.py`：`@pytest.mark.skipif(not _docker_available())` 守护。\n- daemon 不可用时自动跳过，不影响默认套。\n- 验证 DockerSandbox 的 6 方法在真实容器里行为正确。\n\n### 默认套保证\n- 无 Docker daemon、无 API key 时，所有新增测试要么自动 skip、要么用 LocalSubprocessSandbox，默认套永远绿。\n\n## Out of Scope\n\n- **edit 工具**（old_string → new_string 精准替换 + 多匹配 AMBIGUOUS 拒绝）——进切片 2。\n- grep / glob / apply_patch 工具。\n- git 专用工具。\n- Session-scoped Sandbox（跨多次 run 复用容器）。\n- MCP 接入。\n- Artifact Store（大输出引用）。\n- Context Compaction。\n- RAG。\n- Docker 镜像自定义 / Dockerfile 编写（切片 1 用官方 `python:3-slim`）。\n- 并发执行多个 Sandbox 实例的隔离测试。\n\n## Further Notes\n\n- 相关 ADR：`docs/adr/0001-sandbox-abstraction-dual-backend-lazy-docker.md`、`docs/adr/0002-bash-nonzero-exit-is-tool-success.md`。\n- 领域词汇表：`CONTEXT.md`（Sandbox / Workspace / Coding Tool / ExecResult / 命令业务失败 等）。\n- 历史需求来源：`goal/新计划/Day04-Day14_New_SourcePlans/05_Day05_DockerSandbox_CodingTools_SourcePlan.md`（教学语言已剥离，工程需求提炼为本 spec）。\n- docker-py 仓库：https://github.com/docker/docker-py （7.2k★, Docker 官方 SDK, Apache-2.0）。\n- 切片 2 预告：edit 工具 + edit 的 AMBIGUOUS 拒绝测试 + DockerSandbox 更深入的故障注入测试。\n",
+      "closedAt": "2026-09-03T13:04:30Z",
+      "createdAt": "2026-09-03T07:34:19Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 1,
+      "state": "CLOSED",
+      "title": "Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#1 (Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools)\n\n## What to build\n\n定义 `Sandbox` 抽象契约（6 方法：`ensure_started / exec / read_text / write_text / copy_in / stop`）和 `ExecResult` dataclass（`exit_code: int / stdout: str / stderr: str / duration_ms: float`）。实现第一个后端 `LocalSubprocessSandbox`：在本机子进程执行命令（`subprocess.run`），workspace_root 是本机一个真实目录。所有接受路径的方法（`read_text` / `write_text` / `copy_in`）把传入路径 `Path.resolve()` 后校验 `is_relative_to(workspace_root)`，越界抛 `PermissionError`。\n\n交付后应能演示：`sandbox.exec(\"echo hello\")` 返回 `ExecResult(exit_code=0, stdout=\"hello\\n\")`；`sandbox.read_text(\"../../etc/passwd\")` 抛 `PermissionError`；`sandbox.write_text(\"a.txt\",\"hi\")` 后 `sandbox.read_text(\"a.txt\")` 返回 `\"hi\"`。\n\n新增模块：`src/agent_harness/sandbox/`（`base.py` 含 Sandbox ABC + ExecResult，`local.py` 含 LocalSubprocessSandbox）。\n\n## Acceptance criteria\n\n- [ ] `Sandbox` ABC 定义 6 个抽象方法，签名与 spec 一致\n- [ ] `ExecResult` 是 dataclass，含 exit_code / stdout / stderr / duration_ms 四个字段\n- [ ] `LocalSubprocessSandbox.exec` 用 subprocess.run 执行命令，正确捕获 exit_code / stdout / stderr / 计时 duration_ms\n- [ ] `LocalSubprocessSandbox.read_text` / `write_text` 正常读写 workspace 内文件\n- [ ] `LocalSubprocessSandbox.copy_in` 把宿主文件拷入 workspace 目录\n- [ ] 路径越界（如 `../../etc/passwd`）被 resolve + is_relative_to 拒绝，抛 PermissionError\n- [ ] `ensure_started` / `stop` 幂等（多次调用不报错）\n- [ ] 全套契约测试用 LocalSubprocessSandbox，零 Docker 依赖，纳入默认套且全绿\n- [ ] ruff 通过\n\n## Blocked by\n\nNone (can start immediately)\n",
+      "closedAt": "2026-09-03T13:04:19Z",
+      "createdAt": "2026-09-03T07:39:04Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 2,
+      "state": "CLOSED",
+      "title": "Ticket 1: Sandbox 契约 + LocalSubprocessSandbox"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#1 (Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools)\n\n## What to build\n\n实现第二个 Sandbox 后端 `DockerSandbox`：基于 docker-py，镜像默认 `python:3-slim`，容器内 workspace 为 `/workspace`。命令通过 `container.exec_run` 执行，文件读写通过 `docker cp` 或 exec 实现。`docker` 依赖**懒加载**——不进 `pyproject.toml`，`DockerSandbox.__init__` 内 `import docker`，导入失败抛 `RuntimeError(\"DockerSandbox 需要 pip install docker\")`。\n\n测试用 `@pytest.mark.skipif(not _docker_available())` 守护（检查 daemon 可达），默认套自动跳过，不影响无 daemon 环境。\n\n## Acceptance criteria\n\n- [ ] `DockerSandbox` 实现 Sandbox ABC 全部 6 方法\n- [ ] `docker` 在 `__init__` 内懒加载 import，不在模块顶层、不进 pyproject.toml\n- [ ] 无 docker-py 时构造 DockerSandbox 抛清晰 RuntimeError\n- [ ] daemon 开着时，DockerSandbox.exec / read_text / write_text / copy_in 在真实容器里行为正确\n- [ ] 路径越界在容器内同样被拒绝（workspace=/workspace 边界）\n- [ ] 测试 `@pytest.mark.skipif` 守护，daemon 不可用时跳过，默认套全绿\n- [ ] ruff 通过\n\n## Blocked by\n\n- #2 (Ticket 1: Sandbox 契约 + LocalSubprocessSandbox)\n",
+      "closedAt": "2026-09-03T11:12:34Z",
+      "createdAt": "2026-09-03T07:39:32Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 3,
+      "state": "CLOSED",
+      "title": "Ticket 2: DockerSandbox（docker-py 懒加载）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#1 (Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools)\n\n## What to build\n\n在 Sandbox 之上实现三个 Coding Tool，按现有 `Tool` 契约（`contract.py` 的 ABC：name / description / args_schema / execute / side_effect）。每个 Tool 构造时绑定一个 `Sandbox` 实例，execute 内调 Sandbox 方法并把结果包成 `ToolResult`。\n\n三个工具：\n- **ReadTool**（`side_effect = READ_ONLY`）：args_schema 含 `path: str`；调 `sandbox.read_text(path)`；成功返回 `ToolResult.success(data={\"content\": ..., \"path\": ...})`。\n- **WriteTool**（`side_effect = MUTATING`）：args_schema 含 `path: str, content: str`；调 `sandbox.write_text(path, content)`；成功返回 `ToolResult.success(data={\"path\": ..., \"bytes_written\": ...})`。\n- **BashTool**（`side_effect = MUTATING`）：args_schema 含 `command: str`；调 `sandbox.exec(command)`；**无论 exit_code 几**都返回 `ToolResult.ok=True`，`data = {exit_code, stdout, stderr, duration_ms}`（ADR-0002 不变量）。只有 Sandbox 本身抛异常（如 PermissionError / 容器崩）才返回 `ToolResult.failure`，PermissionError 映射成 `ErrorCode.PERMISSION_DENIED`。\n\n新增模块：`src/agent_harness/tools/`（`read.py` / `write.py` / `bash.py` + `__init__.py` 导出）。\n\n## Acceptance criteria\n\n- [ ] ReadTool / WriteTool / BashTool 各自实现 Tool ABC 全部必填字段\n- [ ] side_effect 分类正确：ReadTool=READ_ONLY，WriteTool/BashTool=MUTATING\n- [ ] args_schema 是 Pydantic BaseModel，字段与 spec 一致\n- [ ] ToolExecutor.execute(tool_call) 对三个工具都能正常驱动（校验 → execute → ToolResult）\n- [ ] BashTool 非零 exit_code（如 pytest 失败）返回 ToolResult.ok=True 且 data 含 exit_code/stdout/stderr\n- [ ] Sandbox 抛 PermissionError（路径越界）被 Tool 映射成 ToolResult.failure(error_code=PERMISSION_DENIED)\n- [ ] 非法参数（缺字段 / 类型错）被 Executor 阶段 2 校验拦截，返回 INVALID_ARGUMENT\n- [ ] 全套单元测试用 LocalSubprocessSandbox 做后端，纳入默认套且全绿\n- [ ] ruff 通过\n\n## Blocked by\n\n- #2 (Ticket 1: Sandbox 契约 + LocalSubprocessSandbox)\n",
+      "closedAt": "2026-09-03T13:04:22Z",
+      "createdAt": "2026-09-03T07:40:10Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 4,
+      "state": "CLOSED",
+      "title": "Ticket 3: Coding Tools（read / write / bash）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#1 (Day05 切片 1：Sandbox 抽象 + read/write/bash Coding Tools)\n\n## What to build\n\n真实 qwen LLM 驱动的端到端集成测试：构造 AgentRuntime（真实模型 + LocalSubprocessSandbox + 注册了 read/write/bash 的 ToolRegistry + ToolExecutor），让 Agent 在 workspace 里完成一次真实 Coding 闭环——收到指令（如\"在 workspace 写一个会失败的 pytest 测试文件，然后跑 pytest 看结果\"），真实调用 write 写文件、bash 跑 pytest、read 读失败日志、给最终回答。\n\n测试用 `@pytest.mark.skipif(无 API key)` 守护，默认套不跑、不烧 token。同时把 qwen 的 key/url/name 配进 `.env`（不进 git）。\n\n## Acceptance criteria\n\n- [ ] `.env` 配好 qwen 模型（MODEL_API_KEY / MODEL_BASE_URL / MODEL_NAME），.gitignore 已忽略\n- [ ] 集成测试构造完整 AgentRuntime（真实模型 + LocalSubprocessSandbox + read/write/bash Registry）\n- [ ] Agent 真实调用 write 写文件到 workspace，文件确实存在\n- [ ] Agent 真实调用 bash 跑 pytest，拿到 exit_code/stdout/stderr\n- [ ] Agent 最终 status == COMPLETED，给出了有意义的回答\n- [ ] `@pytest.mark.skipif(无 API key)` 守护，无 key 时跳过，默认套全绿\n- [ ] ruff 通过\n\n## Blocked by\n\n- #4 (Ticket 3: Coding Tools（read / write / bash）)\n",
+      "closedAt": "2026-09-03T13:04:26Z",
+      "createdAt": "2026-09-03T07:40:37Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 5,
+      "state": "CLOSED",
+      "title": "Ticket 4: AgentRuntime 端到端集成（真实 LLM）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\n当前 `AgentRuntime` 用内存 `list[AnyMessage]` 跑 Agent Loop，进程退出后全部对话历史丢失。\n规格不变量 #3 要求 Session Event-sourced / append-only，Roadmap Phase 1 Gate 要求\"简单对话重启后可恢复历史\"。\n需要一个 SessionEvent 模块作为 Agent 交互历史的主要事实源，支撑 Resume、未来 Phase 4 的 Recovery 和 Phase 14 的 Fork/Replay。\n\n## Solution\n\n新建 `session/` 包，实现 append-only typed SessionEvent + JSONL SessionStore + derive_messages 投影 + Session 聚合根。\n改造 `AgentRuntime.run()` 从 `run(user_input)` 变为 `run(session, user_input)`，循环内同步 append 事件，内存 messages list 退化为运行期缓存。\n\n设计已通过 grilling 冻结为 ADR-0003（`docs/adr/0003-session-event-model-phase1.md`），14 项决策全部锁定。\n\n## User Stories\n\n1. 作为 Agent Runtime 开发者，我希望 Agent 的对话历史持久化为 append-only 事件流，这样进程崩溃后能恢复完整会话。\n2. 作为 Agent Runtime 开发者，我希望有一个 `Session` 聚合根作为 Runtime 和外部世界（CLI/Web UI）的单一交互入口，这样调用方不需要手动管 session_id 和 event log。\n3. 作为 Agent Runtime 开发者，我希望 `Session.start()` 能创建新会话并写 `session/started` 事件，这样新会话有明确的起始标记。\n4. 作为 Agent Runtime 开发者，我希望 `Session.resume(session_id)` 能从 JSONL 加载事件、校验 seq 单调性、写 `session/resumed` 事件，这样重启后能无缝继续。\n5. 作为 Agent Runtime 开发者，我希望有一个 `derive_messages()` 纯函数从事件序列投影出模型可见 messages，这样 Runtime 能从事件事实源驱动模型调用。\n6. 作为 Agent Runtime 开发者，我希望 `derive_messages()` 能把 `tool/call` 和 `tool/result` 按 `tool_call_id` 正确配对成 AIMessage + ToolMessage 格式，这样符合 OpenAI/Anthropic/LangChain 标准消息契约。\n7. 作为 Agent Runtime 开发者，我希望事件序列中存在 dangling tool_call（有 tool/call 无 tool/result）时，`derive_messages()` 能检测并注入合成 ToolMessage（content=\"工具执行被中断，结果未知\"），这样消息链保持自洽，模型能看到失败并自主决策。\n8. 作为 Agent Runtime 开发者，我希望合成的 dangling ToolMessage 同时作为新 `tool/result` 事件 append 回 SessionStore（标记 `dangling=true`），这样下次 Resume 时事件链已自洽，不会再次 dangling。\n9. 作为 Agent Runtime 开发者，我希望每次 `run()` 调用生成 `run_id` 并写 `run/started` / `run/completed` / `run/failed` 事件，这样 Run 边界清晰，为 Phase 14 Fork 提供切分依据。\n10. 作为 Agent Runtime 开发者，我希望 AgentRuntime 循环内每轮把 user_message / ai_message / tool_call / tool_result 同步 append 到 SessionStore，这样事件流与运行时状态始终一致。\n11. 作为 Agent Runtime 开发者，我希望 SessionStore 写入采用逐行 `json.dumps + flush`，这样进程崩溃时最多丢失正在写的半行，读取时跳过无法解析的行即可。\n12. 作为 Agent Runtime 开发者，我希望 SessionEvent 文件按 `.agent/sessions/<session_id>/events.jsonl` 组织，这样每个 Session 的所有状态（事件、未来 workspace、未来 checkpoint）集中在一个目录。\n13. 作为 Agent Runtime 开发者，我希望 Diagnostic Log（`logs/agent.jsonl`）与 SessionEvent 分层并存，这样执行链路观察（span/trace）不污染业务事实源。\n14. 作为测试编写者，我希望有一个 `make_session(tmp_path)` 测试 helper，这样现有 ~15-20 处 AgentRuntime 构造点能一行替换为 event-sourced 版本。\n15. 作为 CLI 用户，我希望重启程序后能用 session_id 恢复之前的对话，这样不丢失上下文。\n16. 作为多 Agent 协作者，我希望有 `docs/PHASE_STATUS.md` 记录每个 Phase 的完成状态，这样接手时不会重复已完成的工作。\n\n## Implementation Decisions\n\n### 模块边界\n\n新建 `src/agent_harness/session/` 包，包含：\n- **SessionEvent DTO + EventEnvelope**：frozen dataclass，字段包括 event_id / seq / time / type / session_id / run_id / agent_id / step_id / data / source_event_ids。\n- **JsonlSessionStore**：薄 IO 层，只负责 `read_events(session_id) -> list[SessionEvent]` 和 `append_event(session_id, event) -> None`。不持有业务状态，不抽 ABC（YAGNI——Phase 4 加 SQLite 时再抽）。\n- **Session 聚合根**：持有 `session_id` + `events: list[SessionEvent]`（内存缓存）。对外 API：`start()` / `resume()` / `append()` / `derive_messages()` / `begin_run()` / `end_run()`。\n- **derive_messages 纯函数**：从 events 投影 messages，负责配对与 dangling 检测，无副作用。\n\n### Event vocabulary V1（10 种）\n\n```\nsession/started, session/resumed\nrun/started, run/completed, run/failed\nuser/message\nmodel/completed, model/failed\ntool/call, tool/result\n```\n\n其余 event type（model/delta / step/* / context/* / checkpoint/saved / operation/* / artifact/* / agent/* / approval/*）推迟到对应 Phase。\n\n### Session API 形状\n\n```python\nclass Session:\n    session_id: str\n    events: list[SessionEvent]\n\n    @classmethod\n    def start(cls, store: JsonlSessionStore, *, agent_id: str = \"default\") -> Session: ...\n    @classmethod\n    def resume(cls, store: JsonlSessionStore, session_id: str) -> Session: ...\n    def append(self, event_type: str, data: dict, **ids) -> SessionEvent: ...\n    def derive_messages(self) -> list[AnyMessage]: ...\n    def begin_run(self) -> str: ...\n    def end_run(self, run_id: str, *, status: str, final_text: str = \"\") -> None: ...\n```\n\n- `append()` 同步（blocking）写 JSONL + 更新内存 events。\n- `derive_messages()` 每次重新投影，无副作用。\n- `begin_run()` 生成 run_id + append `run/started`。\n- `end_run()` append `run/completed` 或 `run/failed`。\n\n### AgentRuntime 改造\n\n`run()` 签名从 `run(user_input: str)` 变为 `run(session: Session, user_input: str)`。\n循环开始：`session.append(\"user/message\", {\"content\": user_input})` + `messages = session.derive_messages()`。\n每轮模型调用后：`session.append(\"model/completed\", {...})`。\n工具执行后：逐条 `session.append(\"tool/call\", {...})` + `session.append(\"tool/result\", {...})`。\nmessages list 仍用于循环内传给模型（运行期缓存），events 是事实源。\n\n### 崩溃安全\n\n写入：整行 `json.dumps(event) + \"\\n\"` 一次 `file.write`，紧跟 `flush()`。\n读取：逐行 `json.loads`，无法解析的行跳过（半行 = 没发生）。\n文件布局：`.agent/sessions/<session_id>/events.jsonl`（`.agent/` 已在 `.gitignore`）。\n\n### Diagnostic Log 保留不动\n\n现有 `logging.py` 的 JSONL Diagnostic Log 保持原样。Runtime 在关键节点继续调 `_log()` 写 Diagnostic（保持可观察），同时 append SessionEvent（保持可恢复）。两套分层，Event ≠ Log（不变量 #5）。\n\n### Phase 状态追踪\n\n新建 `docs/PHASE_STATUS.md` 作为实施进度单一事实源（已完成）。AGENTS.md / CLAUDE.md 已加读取指引。\n\n## Testing Decisions\n\n### 测试切入 seam\n\n**单一 seam：`AgentRuntime.run(session, user_input) -> AgentRunResult`**。\n所有测试通过这个最高层入口验证，不直接测内部方法。新增 Session 模块的单元测试也优先通过 `Session.start/resume + derive_messages` 外部 API 验证。\n\n### 测试策略\n\n1. **SessionEvent / Store 单元测试**（新增 `tests/session/`）：\n   - SessionEvent DTO 构造与字段验证。\n   - JsonlSessionStore 写入 + 读取往返（roundtrip）。\n   - 崩溃安全：手动写入半行 JSONL，验证读取跳过。\n   - seq 单调性校验。\n\n2. **derive_messages 单元测试**：\n   - 纯对话事件投影成 HumanMessage + AIMessage。\n   - tool_call + tool_result 配对成 AIMessage(tool_calls) + ToolMessage。\n   - dangling tool_call 检测 + 合成 ToolMessage 注入 + 回 append 验证。\n   - 多工具单轮配对。\n\n3. **Session 生命周期测试**：\n   - start → append 多条 → derive_messages 一致。\n   - resume 加载 → seq 校验 → derive_messages 与内存一致。\n   - begin_run / end_run 事件写入。\n\n4. **AgentRuntime 改造后的回归测试**：\n   - 现有 91 个测试通过 `make_session(tmp_path)` helper 改造，验证 ScriptedModel 场景在 event-sourced 下行为不变。\n   - 新增 1-2 个 Resume 集成测试：跑半段 → 重新 resume → derive_messages → 继续。\n\n### 测试 helper\n\n`make_session(tmp_path) -> Session`：构造 ephemeral Session（用 tmp_path 做 SessionStore 根目录），把现有 ~15-20 处 `runtime.run(user_input)` 的改造压成一行替换。\n\n### 既有测试先例\n\n- `tests/agent/test_agent_loop.py`：ScriptedModel 四象限测试模式（A/B/C/D 场景）——延续这个风格写 Session 的场景测试。\n- `tests/agent/test_integration_coding.py`：真实 LLM 端到端 + `@pytest.mark.integration` marker——Resume 集成测试用同样 marker。\n\n## Out of Scope\n\n- **Checkpoint**（显式快照点）—— Phase 4。\n- **Operation Ledger + Reconcile**—— Phase 4。\n- **Fork**（创建子 Session lineage）—— Phase 14。\n- **Replay projector**（逻辑重放，冻结 Tool Result）—— Phase 14。\n- **SQLite / PostgreSQL SessionStore**—— Phase 4 抽 ABC 时再加。\n- **SessionStore ABC**—— 只有一种后端时不抽（YAGNI）。\n- **流式 model/delta 事件**—— Phase 9。\n- **context/built / context/compacted 事件**—— Phase 5。\n- **Web UI Session Inspector**—— Phase 10。\n\n## Further Notes\n\n- 设计决策详见 `docs/adr/0003-session-event-model-phase1.md`（14 项决策已冻结）。\n- 领域术语详见 `CONTEXT.md` Session/Event 层（8 个新增术语）。\n- Phase 进度详见 `docs/PHASE_STATUS.md`。\n- 复用矩阵决策：Session Tree/Fork/Resume 为 PORT DESIGN（参考 Pi + DeepSeek Harness），但 Phase 1 只实现基础 Resume，产品级 Fork/Replay 推迟。",
+      "closedAt": "2026-09-03T12:35:48Z",
+      "createdAt": "2026-09-03T11:58:40Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 6,
+      "state": "CLOSED",
+      "title": "Phase 1 Spec: SessionEvent 模块 — append-only Event Log + derive_messages + 基础 Resume"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#6 (Phase 1 SessionEvent spec)\n\n## What to build\n\nSessionEvent 持久化的最底层：定义事件 DTO 与词汇表，实现 JSONL append-only 存储。\n\n这是一个完整的垂直切片：从 SessionEvent 数据结构定义，到 JsonlSessionStore 的写入/读取 IO，到崩溃安全的读取验证，端到端可独立测试。上层 Session 聚合根和 derive_messages 在后续 ticket 中构建于此基础之上。\n\n## Acceptance criteria\n\n- [ ] `SessionEvent` frozen dataclass 定义完整：event_id / seq / time / type / session_id / run_id / agent_id / step_id / data / source_event_ids（可空字段允许 None）\n- [ ] 10 种 event type 常量定义：`session/started`、`session/resumed`、`run/started`、`run/completed`、`run/failed`、`user/message`、`model/completed`、`model/failed`、`tool/call`、`tool/result`\n- [ ] `JsonlSessionStore` 实现 `read_events(session_id) -> list[SessionEvent]` 和 `append_event(session_id, event) -> None`\n- [ ] 文件布局 `.agent/sessions/<session_id>/events.jsonl`（或测试时用 tmp_path 自定义根目录）\n- [ ] 写入：整行 `json.dumps(event) + \"\\n\"` 一次 `file.write`，紧跟 `flush()`\n- [ ] 读取：逐行 `json.loads`，无法解析的行跳过（崩溃安全：半行 = 没发生）\n- [ ] 单元测试覆盖：DTO 构造与字段、写入读取 roundtrip、半行损坏跳过、seq 单调性读取\n- [ ] ruff clean\n- [ ] 现有 91 个默认套测试不受影响（本 ticket 不改动现有代码）\n\n## Blocked by\n\nNone (can start immediately)",
+      "closedAt": "2026-09-03T12:35:25Z",
+      "createdAt": "2026-09-03T12:00:11Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 7,
+      "state": "CLOSED",
+      "title": "Ticket A: SessionEvent DTO + JsonlSessionStore + 单元测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#6 (Phase 1 SessionEvent spec)\n\n## What to build\n\n从 SessionEvent 序列投影出模型可见 messages 列表的纯函数。这是连接事件事实源与模型调用的关键桥梁。\n\n完整垂直切片：给定一段事件序列，产出符合 OpenAI/Anthropic/LangChain 标准的 messages 列表，包括 tool_call/tool_result 配对和 dangling 检测。\n\n## Acceptance criteria\n\n- [ ] `derive_messages(events: list[SessionEvent]) -> list[AnyMessage]` 纯函数，无副作用\n- [ ] 纯对话事件（user/message + model/completed）投影成 HumanMessage + AIMessage\n- [ ] tool/call + tool/result 按 tool_call_id 配对成 AIMessage(tool_calls=[...]) + ToolMessage\n- [ ] 一次 model/completed 带多个 tool_calls 时，投影成一条 AIMessage + 多条 ToolMessage（以 AIMessage 为单位）\n- [ ] dangling tool_call（有 tool/call 无匹配 tool/result）检测后注入合成 ToolMessage，content 写明\"工具执行被中断，结果未知\"\n- [ ] 合成 ToolMessage 的 tool_call_id 与原 tool/call 匹配\n- [ ] dangling 检测时打印 WARN 日志告知调试者\n- [ ] 单元测试覆盖：纯对话、单工具配对、多工具单轮配对、dangling 注入、混合场景\n- [ ] ruff clean\n\n## Blocked by\n\n- #7 (Ticket A — 需要 SessionEvent DTO 定义)",
+      "closedAt": "2026-09-03T12:35:25Z",
+      "createdAt": "2026-09-03T12:00:58Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 8,
+      "state": "CLOSED",
+      "title": "Ticket B: derive_messages 纯函数 + dangling 处理 + 单元测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#6 (Phase 1 SessionEvent spec)\n\n## What to build\n\nSession 领域聚合根：持有 session_id 与已加载事件列表，对外提供 start / resume / append / derive_messages / begin_run / end_run 业务方法。这是 Runtime 和外部世界（CLI/Web UI）交互的单一入口。\n\n完整垂直切片：从新建/恢复 Session，到 append 事件，到投影 messages，到标记 Run 边界，端到端可独立验证。\n\n## Acceptance criteria\n\n- [ ] `Session.start(store, *, agent_id=\"default\") -> Session`：生成 session_id、创建 JSONL、append `session/started` 事件\n- [ ] `Session.resume(store, session_id) -> Session`：加载 JSONL、校验 seq 单调、append `session/resumed` 事件\n- [ ] `Session.append(event_type, data, **ids) -> SessionEvent`：分配 seq（单调递增）、同步写 JSONL、更新内存 events list\n- [ ] `Session.derive_messages() -> list[AnyMessage]`：委托 derive_messages 纯函数，从内存 events 投影\n- [ ] `Session.begin_run() -> str`：生成 run_id、append `run/started`、返回 run_id\n- [ ] `Session.end_run(run_id, *, status, final_text=\"\") -> None`：append `run/completed` 或 `run/failed`\n- [ ] `session/__init__.py` 导出 Session、SessionEvent、JsonlSessionStore、derive_messages\n- [ ] 单元测试：start → append 多条 → derive_messages 一致；resume 加载 → seq 校验 → derive_messages 与 start 后一致；begin_run/end_run 事件正确写入\n- [ ] ruff clean\n\n## Blocked by\n\n- #7 (Ticket A — 需要 SessionEvent DTO + JsonlSessionStore)\n- #8 (Ticket B — 需要 derive_messages 纯函数)",
+      "closedAt": "2026-09-03T12:35:26Z",
+      "createdAt": "2026-09-03T12:01:34Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 9,
+      "state": "CLOSED",
+      "title": "Ticket C: Session 聚合根 + 生命周期 + 单元测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#6 (Phase 1 SessionEvent spec)\n\n## What to build\n\n把 AgentRuntime 从内存 messages list 迁移到 event-sourced 架构：`run()` 接受 Session 对象，循环内同步 append 事件，messages 退化为运行期缓存。同时改造全部现有测试，新增 Resume 集成测试。\n\n这是 Phase 1 的收官 ticket：完成后 Phase 1 Gate 达成（简单对话重启后可恢复历史）。\n\n## Acceptance criteria\n\n- [ ] `AgentRuntime.run(session: Session, user_input: str)` 签名替换旧的 `run(user_input: str)`\n- [ ] 循环开始：`session.append(\"user/message\", {\"content\": user_input})`\n- [ ] 每轮模型调用后：`session.append(\"model/completed\", {...})` 或 `session.append(\"model/failed\", {...})`\n- [ ] 工具执行后：逐条 `session.append(\"tool/call\", {...})` + `session.append(\"tool/result\", {...})`\n- [ ] Run 生命周期：`session.begin_run()` / `session.end_run(run_id, status=...)` 包裹整个循环\n- [ ] messages list 仍用于循环内传给模型（运行期缓存），但事实源是 events\n- [ ] Diagnostic Log 保持不变（`_log()` 继续调用），实现双写\n- [ ] 提供 `make_session(tmp_path) -> Session` 测试 helper\n- [ ] 改造 `tests/agent/test_agent_loop.py` 全部 ~10 处 AgentRuntime 构造点\n- [ ] 改造 `tests/agent/test_integration_coding.py` 全部 ~3 处构造点\n- [ ] 新增 Resume 集成测试（ScriptedModel 跑半段 → 创建新 Session.resume → derive_messages → 继续 → 验证历史完整）\n- [ ] 现有 91 个默认套测试全部继续通过（改造后）\n- [ ] 新增的 Session 模块测试全部通过\n- [ ] ruff clean\n- [ ] Phase 1 Gate 达成：进程重启后可从 JSONL 恢复完整对话历史\n- [ ] 完成后关闭 #6（Phase 1 spec）\n\n## Blocked by\n\n- #9 (Ticket C — 需要 Session 聚合根完整 API)",
+      "closedAt": "2026-09-03T12:35:26Z",
+      "createdAt": "2026-09-03T12:02:09Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 10,
+      "state": "CLOSED",
+      "title": "Ticket D: AgentRuntime event-sourced 改造 + 测试迁移 + Resume 集成测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\nPhase 3（Docker Sandbox + Coding Tools）目前已落地 read / write / bash 三个 Coding Tool（commit `76049d0`），但 `05_SANDBOX_CODING_TOOLS.md` 规格要求 V1 Coding Tools 共 9 个。剩余 6 个（edit / grep / glob / apply_patch / git_status / git_diff）尚未实现，Agent 当前无法做精确字符串替换、内容搜索、文件名匹配、多块补丁、或只读 git 查询——这些是 Coding Agent 日常工作的核心操作。没有它们，Agent 只能用 write 整体覆盖文件、用 bash 盲搜，效率低且容易破坏未改动区域。\n\n## Solution\n\n按现有 Tool 契约（`contract.py`）和 Sandbox 边界（`base.py`）实现 6 个新 Coding Tool，全部构造时绑定一个 Sandbox 实例，由 ToolExecutor 以标准 Validation-first 三阶段驱动，不感知 Sandbox 具体后端。同时给 Sandbox ABC 扩展一个最小新方法 `list_files(pattern) -> list[str]`，让 grep / glob 能跨后端（LocalSubprocess + Docker）可移植地枚举 workspace 文件。\n\n完成后 Agent 可以：精确替换文件中的一段字符串（edit）；在 workspace 文件内容里做正则搜索（grep）；按 glob 模式找文件（glob）；对单个文件原子地应用多块补丁（apply_patch）；以及跑只读 git status / git diff 查询仓库状态——所有操作都被 Sandbox 路径边界保护，越界访问统一映射成 PERMISSION_DENIED。\n\n## User Stories\n\n1. 作为 Agent，我想把文件里的一段确切字符串替换成新字符串，这样修小改时就不用整体覆盖重写整个文件。\n2. 作为 Agent，当文件里没有匹配到我要替换的字符串时，我想收到一个明确的\"未找到匹配\"失败结果，这样我能知道是文件变了还是我记错了内容。\n3. 作为 Agent，当文件里有多处匹配同一字符串时，我想收到一个明确的\"多个匹配\"失败结果，这样我不会无意中改错地方。\n4. 作为 Agent，当我明确想替换所有匹配时，我想传一个 replace_all 标志把所有匹配都替换掉。\n5. 作为 Agent，我想在 workspace 的文件内容里做正则搜索，这样我能快速定位包含某个模式（如函数定义、TODO、错误信息）的代码行。\n6. 作为 Agent，当 grep 找到匹配时，我想看到文件路径、行号、和匹配行的文本，这样我能直接定位到要改的位置。\n7. 作为 Agent，当 grep 匹配很多时，我想结果有一个合理的上限并被截断，这样巨大的输出不会撑爆模型上下文。\n8. 作为 Agent，我想按 glob 模式列出 workspace 里匹配的文件路径，这样我能找到\"所有 .py 文件\"或\"src 下的所有 test_*.py\"。\n9. 作为 Agent，当 glob 匹配很多时，我想结果有一个合理的上限并被截断，与 grep 同理。\n10. 作为 Agent，当我想对单个文件做多处修改时，我想用 apply_patch 一次性应用多个 old_string→new_string 补丁块，而不是串行调很多次 edit。\n11. 作为 Agent，当 apply_patch 的任意一块补丁匹配失败（0 或 >1）时，我想整个 apply_patch 原子失败、文件不被改动，这样我不会留下半改的文件。\n12. 作为 Agent，当 apply_patch 全部补丁块成功时，我想文件被一次性写入最终内容。\n13. 作为 Agent，我想跑 `git status` 看 workspace 里有哪些文件被改了、新增了、删了，这样我了解当前改动范围。\n14. 作为 Agent，我想跑 `git diff` 看具体改了什么内容（可选只看暂存区或某个路径），这样我能在提交前 review 改动。\n15. 作为 Agent，当我调 git_status / git_diff 时，工具只跑只读 git 子命令，我无法通过它 commit / push / reset。\n16. 作为 Agent，当我尝试访问 workspace 边界外的路径时（如 `../../etc/passwd`），任何 Coding Tool 都拒绝并返回 PERMISSION_DENIED。\n17. 作为 Agent，当 grep / glob 模式不合法（坏正则、坏 glob）时，我想收到 INVALID_ARGUMENT 而不是崩溃。\n18. 作为 Agent，当我传给 edit / apply_patch / git_diff 的参数类型不对（如 path 不是字符串）时，Executor 在执行前拦截并返回 INVALID_ARGUMENT。\n19. 作为开发者，我想 grep / glob 在 LocalSubprocessSandbox 和 DockerSandbox 上都能工作，这样 Coding Tool 不绑定到某一个后端。\n20. 作为开发者，我想所有新工具的 side_effect 正确分类（READ_ONLY vs MUTATING），这样批次调度能正确决定并发或串行。\n21. 作为开发者，我想所有新工具复用现有 Tool 契约和 ToolResult 语义，不引入新的结果类型或新错误码（除非不可省略）。\n22. 作为开发者，当 ToolExecutor 跑这些新工具时，它们的 tool_call_id 配对、重试语义、批次调度行为和 read / write / bash 完全一致。\n\n## Implementation Decisions\n\n### 新增 Sandbox ABC 方法：`list_files`\n\nSandbox ABC（`sandbox/base.py`）新增一个抽象方法：\n\n```python\n@abstractmethod\ndef list_files(self, pattern: str) -> list[str]:\n    \"\"\"枚举 workspace 内匹配 glob 模式的文件，返回 workspace 相对路径列表。\n    越界访问（pattern 解析出 workspace 外）抛 PermissionError。\n    仅返回文件，不返回目录。结果按路径排序。\n    \"\"\"\n```\n\n- **LocalSubprocessSandbox**：用 `os.walk(workspace_root)` + `fnmatch` 实现递归匹配，返回相对 workspace_root 的 POSIX 风格相对路径。\n- **DockerSandbox**：用 `exec(\"find . -type f\")` 拿到文件列表后在 Python 里做 fnmatch 过滤，返回容器内相对 `/workspace` 的路径。\n- pattern 为空字符串或 `\"*\"` 时返回 workspace 内所有文件。\n- 此方法是所有 6 个新工具里唯一需要改 Sandbox 契约的地方；edit / apply_patch 只用已有的 read_text / write_text，git_status / git_diff 只用已有的 exec。\n\n### edit 工具\n\n- **参数 schema**：`path: str`、`old_string: str`、`new_string: str`、`replace_all: bool = False`。\n- **语义**：read_text → 用 `str.count(old_string)` 计数匹配：\n  - `replace_all=False`：0 match → failure(TOOL_EXECUTION_ERROR, \"未找到匹配的字符串\")；1 match → success（替换）；>1 match → failure(TOOL_EXECUTION_ERROR, \"找到 N 处匹配，需更具体或传 replace_all=true\")。\n  - `replace_all=True`：0 match → 同上 failure；≥1 match → success（用 `str.replace` 全替换）。\n- **不变量**：old_string 不能为空字符串（schema 校验拦截 → INVALID_ARGUMENT）。\n- **side_effect**：MUTATING（改文件）。\n- **路径越界**：read_text 抛 PermissionError → 映射 PERMISSION_DENIED。\n- **文件不存在**：read_text 抛 FileNotFoundError → 映射 TOOL_EXECUTION_ERROR。\n- 成功时 data 含 `{\"path\": ..., \"replacements\": N}`。\n\n### grep 工具\n\n- **参数 schema**：`pattern: str`（正则）、`path: str = \".\"`（搜索范围子目录，相对 workspace）、`include: str = \"*\"`（文件名 glob 过滤）、`max_results: int = 100`（上限，防上下文爆炸）。\n- **语义**：用 `sandbox.list_files(\"**/\" + include)` 枚举（或限定 path 子树），对每个文件 read_text，逐行 `re.search(pattern)`，收集 `{path, line_number, line}`。\n- **坏正则**：`re.compile` 抛异常 → 映射 INVALID_ARGUMENT。\n- **二进制 / 编码失败文件**：read_text 抛 UnicodeDecodeError → 跳过该文件（不算错误）。\n- **截断**：匹配数达到 max_results 时停止，在 data 里标 `truncated: True`。\n- **side_effect**：READ_ONLY。\n- 成功时 data 含 `{\"matches\": [{path, line_number, line}, ...], \"count\": N, \"truncated\": bool}`。\n\n### glob 工具\n\n- **参数 schema**：`pattern: str`（glob 模式，如 `\"**/*.py\"`、`\"src/test_*.py\"`）、`max_results: int = 100`。\n- **语义**：调 `sandbox.list_files(pattern)`，截断到 max_results。\n- **side_effect**：READ_ONLY。\n- 成功时 data 含 `{\"paths\": [...], \"count\": N, \"truncated\": bool}`。\n\n### apply_patch 工具\n\n- **参数 schema**：`path: str`、`hunks: list[{old_string: str, new_string: str}]`（有序补丁块列表）。\n- **语义（原子）**：\n  1. read_text 拿到原始内容。\n  2. 对每个 hunk：校验 old_string 在当前（已应用前面 hunk 的）内容里恰好匹配 1 次；0 或 >1 → 立即整体失败，不写文件。\n  3. 全部 hunk 校验+应用通过后，write_text 写入最终内容。\n  4. 用一个本地变量做 in-memory 应用，只有全部成功才调 write_text——保证原子性。\n- **任意 hunk old_string 为空**：schema 校验拦截 → INVALID_ARGUMENT。\n- **side_effect**：MUTATING。\n- **路径越界 / 文件不存在**：映射同 edit。\n- 成功时 data 含 `{\"path\": ..., \"hunks_applied\": N}`。\n\n### git_status 工具\n\n- **参数 schema**：`pathspec: str = \"\"`（可选路径过滤）。\n- **语义**：调 `sandbox.exec(f\"git status --porcelain=v1 {shlex.quote(pathspec)}\")`。\n- **只读保证**：命令是硬编码的 `git status`，不接受用户自定义子命令；模型无法通过此工具 commit / push / reset。\n- **side_effect**：READ_ONLY。\n- **ADR-0002 适用**：exit_code 非零（如不是 git 仓库）仍是 ok=True，stdout/stderr 在 data 里供模型判断。\n- 成功时 data 含 `{\"exit_code\": ..., \"stdout\": ..., \"stderr\": ...}`。\n\n### git_diff 工具\n\n- **参数 schema**：`staged: bool = False`（是否看暂存区）、`path: str = \"\"`（可选路径过滤）。\n- **语义**：调 `sandbox.exec(\"git diff \" + (\"--staged \" if staged else \"\") + shlex.quote(path))`。\n- **只读保证**：同 git_status——硬编码 `git diff`，不接受子命令。\n- **side_effect**：READ_ONLY。\n- **ADR-0002 适用**：exit_code 非零仍是 ok=True。\n- 成功时 data 含 `{\"exit_code\": ..., \"stdout\": ..., \"stderr\": ...}`。\n\n### 工具注册与导出\n\n- 6 个新工具类在 `tools/__init__.py` 导出。\n- 集成测试的 `_make_runtime` fixture 注册全部 9 个 Coding Tools（read/write/bash + 6 个新）。\n\n### Approval（REQUIRE_APPROVAL）——本 Spec 不实现\n\n`05_SANDBOX_CODING_TOOLS.md` 提到的 Permission Policy 分层（read-only / workspace-write / danger-full-access）和 REQUIRE_APPROVAL 机制属于 Capability / Permission 系统（Phase 7），不在本 Spec 实现范围。当前 bash 的 MUTATING side_effect 已让批次调度串行执行它；Sandbox 路径边界已防止越界。Approval 作为 Phase 3 内独立后续 spec 处理。\n\n### Session-scoped Sandbox 生命周期——本 Spec 不实现\n\nSession 绑定 Sandbox 实例、resume 时恢复 workspace 的生命周期管理，属于 Storage + Recovery（Phase 4），不在本 Spec 范围。本 Spec 的工具只要求构造时传入一个已就绪的 Sandbox 实例。\n\n## Testing Decisions\n\n### 测试缝（Seam）\n\n复用现有唯一测试缝：`LocalSubprocessSandbox(tmp_path)` + `ToolRegistry`（注册工具）+ `ToolExecutor.execute(tool_call dict)` + 断言 `ToolResult` 形状。这正是 `tests/tools/test_coding_tools.py` 已建立的模式。新工具的测试追加到同一文件或同目录新文件，不引入新缝。\n\nSandbox 新方法 `list_files` 的契约测试追加到 `tests/sandbox/`，匹配现有 Sandbox 契约测试风格（LocalSubprocessSandbox 真目录 + 断言返回值；DockerSandbox 用 `@pytest.mark.integration` + skipif Docker 不可用）。\n\n### 什么算好测试\n\n- **只测外部行为**：通过 ToolExecutor 驱动工具、断言 ToolResult 字段（ok / data / error_code），不测私有方法。\n- **不变量优先**：edit 的 0/1/>1 三态、apply_patch 的原子性（失败时文件不变）、git 的只读保证（硬编码命令）、路径越界 → PERMISSION_DENIED、ADR-0002（git exit_code 非零仍 ok=True）。\n- **边界用例**：空 old_string、坏正则、坏 glob、空 workspace、max_results 截断、二进制文件跳过、pathspec 转义。\n- **side_effect 断言**：每个工具测 `tool.side_effect == 期望值`。\n- **先例**：完全参照 `test_coding_tools.py` 里 `TestReadTool` / `TestWriteTool` / `TestBashTool` 的结构（side_effect 断言 + happy path + 错误映射 + Validation）。\n\n### 具体测试模块\n\n- `tests/tools/test_edit_tool.py`：0/1/>1 三态、replace_all、空 old_string、路径越界、文件不存在、覆盖写生效。\n- `tests/tools/test_grep_tool.py`：基础正则搜索、行号+文本返回、include 过滤、path 子树限定、坏正则 → INVALID_ARGUMENT、max_results 截断、空 workspace、二进制文件跳过。\n- `tests/tools/test_glob_tool.py`：基础 glob 匹配、递归 `**` 模式、max_results 截断、无匹配返回空列表、坏模式不崩溃。\n- `tests/tools/test_apply_patch_tool.py`：多 hunk 全成功、任意 hunk 0 匹配 → 原子失败文件不变、任意 hunk >1 匹配 → 原子失败、空 old_string、路径越界、文件不存在。\n- `tests/tools/test_git_tools.py`：git_status happy path（在 tmp_path init git）、git_diff happy path、staged 选项、非 git 仓库 → exit_code 非零但 ok=True（ADR-0002）、只读保证（命令硬编码无法注入子命令）。\n- `tests/sandbox/test_list_files.py`（或追加到现有 sandbox 测试）：LocalSubprocessSandbox list_files 基础匹配、递归 `**`、空 workspace、只返回文件不返回目录、路径排序。\n- `tests/tools/test_coding_tools.py`：批次调度测试追加——纯 READ_ONLY 批（如多个 glob）可并发、MUTATING + READ_ONLY 混批串行（已有此测试模式，追加新工具的 side_effect 分类断言即可）。\n\n## Out of Scope\n\n- **Approval / REQUIRE_APPROVAL 机制**：属 Capability / Permission 系统（Phase 7），本 Spec 不实现。后续单独 spec。\n- **Session-scoped Sandbox 生命周期**：Session 绑定 Sandbox、resume 时 workspace 恢复，属 Storage + Recovery（Phase 4）。\n- **DockerSandbox 的 list_files 集成测试**：实现 DockerSandbox.list_files 但集成测试标记 `@pytest.mark.integration` + skipif Docker 不可用；CI 默认只跑 LocalSubprocessSandbox 路径。\n- **Unified diff 格式解析**：apply_patch V1 用结构化 hunks（list of {old_string, new_string}），不解析标准 unified diff。后者作为未来增强。\n- **ripgrep / 高级搜索引擎集成**：grep V1 用 Python `re` 逐文件逐行搜索，不接入 ripgrep。Reuse First 评估结论：V1 量级不需要。\n- **新 ErrorCode**：不为 edit 的 NOT_FOUND / AMBIGUOUS 新增 ErrorCode 枚举值——映射到现有 TOOL_EXECUTION_ERROR 并在 message 里说明状态。保持错误词汇表稳定。\n\n## Further Notes\n\n- **Reuse First 检查（`13_OPEN_SOURCE_REUSE_MATRIX.md`）**：Coding Tools 的 edit/grep/glob/apply_patch 是轻量文件操作，标准库（re / fnmatch / pathlib / os.walk）已足够，不需要引入外部库。git_status / git_diff 只是 exec 硬编码只读命令。结论：BUILD，但建立在已有 Sandbox 抽象上，零新依赖。\n- **架构不变量守护**：\n  - 工具只用统一 ToolExecutor 路径执行（不变量 #7）。\n  - 无新 Retry 语义——工具失败走现有 ErrorCode 分类（不变量 #8）。\n  - Sandbox 是 Runtime 安全边界，路径越界在 Sandbox 层强制，不靠 prompt（不变量 #11）。\n  - 新工具不改 ToolResult 形状、不改 Tool 契约、不改 ToolExecutor 行为。\n- **ADR-0002 适用范围**：git_status / git_diff 和 bash 一样遵循\"命令 exit_code 非零 ≠ Tool 失败\"——exit_code / stdout / stderr 在 data 里供模型判断。edit / grep / glob / apply_patch 不走 exec，不受 ADR-0002 影响，它们的失败是真正的 Tool 失败（ok=False）。\n- **依赖关系**：本 Spec 不依赖 Phase 1 SessionEvent（工具是 Stateless 的，由 Runtime 传入 Sandbox）。可在 Phase 1 完成后或并行实现。\n",
+      "closedAt": "2026-09-03T13:27:04Z",
+      "createdAt": "2026-09-03T12:57:41Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 11,
+      "state": "CLOSED",
+      "title": "Phase 3 Spec: 剩余 6 个 Coding Tools（edit / grep / glob / apply_patch / git_status / git_diff）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n给 Sandbox ABC 扩展一个最小新方法 `list_files(pattern) -> list[str]`，让 grep / glob 工具能跨后端可移植地枚举 workspace 文件。LocalSubprocessSandbox 用 `os.walk` + `fnmatch` 实现递归匹配，返回 workspace 相对路径（POSIX 风格，排序）。DockerSandbox 用 `exec(\"find . -type f\")` + Python 侧 fnmatch 过滤实现。这是后续 glob / grep 工具的地基——没有它，grep/glob 要么只支持 Local 后端、要么每个工具各自实现枚举逻辑。\n\n## Acceptance criteria\n\n- [ ] Sandbox ABC 新增抽象方法 `list_files(self, pattern: str) -> list[str]`，docstring 说明语义（枚举 workspace 内匹配 glob 的文件、仅文件不目录、相对路径、排序、越界抛 PermissionError）。\n- [ ] LocalSubprocessSandbox.list_files 实现：`os.walk(workspace_root)` + `fnmatch.fnmatch` / `fnmatch.translate` 做递归 `**` glob 匹配；返回相对 workspace_root 的 POSIX 风格路径（正斜杠）；结果排序；仅文件不目录。\n- [ ] DockerSandbox.list_files 实现：`exec(\"find . -type f -printf '%P\\n'\")` 拿文件列表后 Python 侧 fnmatch 过滤；返回容器内相对 `/workspace` 路径；排序。\n- [ ] pattern 为空字符串或 `\"*\"` 时返回 workspace 内所有文件。\n- [ ] 单元测试（LocalSubprocessSandbox）：基础 `*.py` 匹配、递归 `**/*.py` 匹配嵌套子目录、空 workspace 返回空列表、只返回文件不返回目录、结果排序、多扩展名混合。\n- [ ] DockerSandbox.list_files 集成测试标记 `@pytest.mark.integration` + skipif Docker 不可用（与现有 DockerSandbox 测试一致）。\n- [ ] 所有现有测试仍通过（`pytest -q`）。\n\n## Blocked by\n\nNone（can start immediately）。\n",
+      "closedAt": "2026-09-03T13:26:39Z",
+      "createdAt": "2026-09-03T12:59:25Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 12,
+      "state": "CLOSED",
+      "title": "Ticket 1: Sandbox list_files 方法 + LocalSubprocessSandbox/DockerSandbox 实现 + 契约测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n实现 edit Coding Tool：精确字符串替换（exact old_string → new_string）。Agent 用它做小改而不必整体覆盖文件。核心是三态匹配语义：0 匹配失败（NOT_FOUND）、1 匹配成功、>1 匹配失败（AMBIGUOUS），以及 replace_all=true 时全替换。复用现有 Sandbox.read_text / write_text，不改 Sandbox 契约。由 ToolExecutor 以 Validation-first 三阶段驱动，与 read/write/bash 同一执行路径。\n\n## Acceptance criteria\n\n- [ ] EditTool 类继承 Tool 契约，name=\"edit\"，构造时绑定 Sandbox。\n- [ ] 参数 schema（Pydantic BaseModel）：`path: str`、`old_string: str`（min_length=1，空字符串 → schema 拒绝 → INVALID_ARGUMENT）、`new_string: str`、`replace_all: bool = False`。\n- [ ] side_effect == MUTATING。\n- [ ] execute 语义：read_text → `content.count(old_string)`：\n  - replace_all=False：0 → failure(TOOL_EXECUTION_ERROR, message 说明未找到)；1 → success（单次替换）；>1 → failure(TOOL_EXECUTION_ERROR, message 说明 N 处匹配需更具体或 replace_all=true）。\n  - replace_all=True：0 → failure(同上)；≥1 → success（`str.replace` 全替换）。\n- [ ] 成功时 write_text 写入替换后内容；data 含 `{\"path\": <path>, \"replacements\": <N>}`。\n- [ ] 路径越界（read_text 抛 PermissionError）→ PERMISSION_DENIED。\n- [ ] 文件不存在（read_text 抛 FileNotFoundError）→ TOOL_EXECUTION_ERROR。\n- [ ] 单元测试（通过 ToolExecutor 驱动，参照 test_coding_tools.py 风格）：side_effect 断言、单匹配成功 + 文件内容确实变了、0 匹配失败、>1 匹配失败、replace_all=True 全替换成功、replace_all=True 0 匹配失败、空 old_string → INVALID_ARGUMENT、路径越界 → PERMISSION_DENIED、文件不存在 → TOOL_EXECUTION_ERROR、参数类型错 → INVALID_ARGUMENT。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\nNone（can start immediately；只用已有 read_text / write_text）。\n",
+      "closedAt": "2026-09-03T13:26:42Z",
+      "createdAt": "2026-09-03T13:00:00Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 13,
+      "state": "CLOSED",
+      "title": "Ticket 2: edit Coding Tool（精确字符串替换，0/1/>1 三态 + replace_all）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n实现 apply_patch Coding Tool：对单个文件原子地应用多个 old_string→new_string 补丁块。Agent 用它做多处相关修改时一次调用搞定，而不是串行调多次 edit。核心不变量是原子性——任意一个 hunk 匹配失败（0 或 >1），整个 apply_patch 失败，文件不被改动（不留半改状态）。复用现有 read_text / write_text，in-memory 应用全部 hunk 后才写盘。\n\n## Acceptance criteria\n\n- [ ] ApplyPatchTool 类继承 Tool 契约，name=\"apply_patch\"，构造时绑定 Sandbox。\n- [ ] 参数 schema：`path: str`、`hunks: list[Hunk]`，其中 Hunk 是 Pydantic 模型 `{old_string: str (min_length=1), new_string: str}`。空 hunks 列表 → schema 拒绝 → INVALID_ARGUMENT（min_items=1）。\n- [ ] side_effect == MUTATING。\n- [ ] execute 语义（原子）：\n  1. read_text 拿原始内容，赋给本地变量 `current`。\n  2. 逐 hunk：校验 `current.count(hunk.old_string)`；≠1 → 立即返回 failure(TOOL_EXECUTION_ERROR, message 说明第 K 个 hunk 匹配数为 N)，**不调 write_text**。\n  3. =1 → 在 `current` 上做单次替换，继续下一 hunk。\n  4. 全部 hunk 通过 → write_text(current)；data 含 `{\"path\": <path>, \"hunks_applied\": <N>}`。\n- [ ] 路径越界 → PERMISSION_DENIED；文件不存在 → TOOL_EXECUTION_ERROR。\n- [ ] 单元测试：多 hunk 全成功 + 文件最终内容正确、第 1 个 hunk 0 匹配 → 失败且文件未被任何改动（原子性）、非首 hunk 0 匹配 → 失败且文件未改（验证前面 hunk 的改动也没落盘）、任意 hunk >1 匹配 → 失败且文件未改、空 old_string → INVALID_ARGUMENT、空 hunks 列表 → INVALID_ARGUMENT、路径越界 → PERMISSION_DENIED、文件不存在 → TOOL_EXECUTION_ERROR、参数类型错 → INVALID_ARGUMENT。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\nNone（can start immediately；只用已有 read_text / write_text）。\n",
+      "closedAt": "2026-09-03T13:26:46Z",
+      "createdAt": "2026-09-03T13:00:37Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 14,
+      "state": "CLOSED",
+      "title": "Ticket 3: apply_patch Coding Tool（多 hunk 原子补丁）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n实现 git_status 和 git_diff 两个只读 Coding Tool。它们让 Agent 查看 workspace 的 git 改动状态（status）和具体差异内容（diff），但不能 commit / push / reset。两者都通过 Sandbox.exec 跑硬编码的只读 git 子命令，模型无法注入自定义子命令。遵循 ADR-0002：命令 exit_code 非零（如 workspace 不是 git 仓库）仍是 ok=True，stdout/stderr 在 data 里供模型判断。\n\n## Acceptance criteria\n\n- [ ] GitStatusTool 类：name=\"git_status\"，参数 schema `pathspec: str = \"\"`，side_effect == READ_ONLY。execute 调 `sandbox.exec(\"git status --porcelain=v1 \" + shlex.quote(pathspec))`；命令硬编码，pathspec 用 `shlex.quote` 转义防注入。返回 ToolResult.success，data 含 `{\"exit_code\": ..., \"stdout\": ..., \"stderr\": ...}`。ADR-0002：exit_code 非零仍 ok=True。\n- [ ] GitDiffTool 类：name=\"git_diff\"，参数 schema `staged: bool = False`、`path: str = \"\"`，side_effect == READ_ONLY。execute 调 `sandbox.exec(\"git diff \" + (\"--staged \" if staged else \"\") + shlex.quote(path))`；命令硬编码。返回结构同 git_status。\n- [ ] 两者路径越界不适用（无 workspace 路径参数走 Sandbox 路径校验；pathspec/path 是 git 内部路径，由 git 自己限定在 workspace）。\n- [ ] 单元测试（在 tmp_path 里 `git init` + 写文件 + `git add` 构造真实仓库状态）：\n  - git_status：有改动时 stdout 含 porcelain 行、exit_code=0、ok=True。\n  - git_status：非 git 仓库（干净 tmp_path 不 init）→ exit_code 非零、ok=True（ADR-0002 关键断言）。\n  - git_status：pathspec 过滤生效。\n  - git_diff：有未暂存改动时 stdout 含 diff 内容。\n  - git_diff：staged=True 看暂存区（先 git add 再 diff --staged）。\n  - git_diff：非 git 仓库 → exit_code 非零、ok=True。\n  - 两者 side_effect 断言 READ_ONLY。\n  - 参数类型错 → INVALID_ARGUMENT。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\nNone（can start immediately；只用已有 exec）。\n",
+      "closedAt": "2026-09-03T13:26:50Z",
+      "createdAt": "2026-09-03T13:01:12Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 15,
+      "state": "CLOSED",
+      "title": "Ticket 4: git_status + git_diff 只读 Coding Tools"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n实现 glob Coding Tool：按 glob 模式列出 workspace 内匹配的文件路径。Agent 用它找\"所有 .py 文件\"或\"src 下的 test_*.py\"。直接调 Sandbox.list_files（Ticket 1 提供），做 max_results 截断防上下文爆炸。READ_ONLY，可与同批其他 READ_ONLY 工具并发。\n\n## Acceptance criteria\n\n- [ ] GlobTool 类：name=\"glob\"，构造时绑定 Sandbox。\n- [ ] 参数 schema：`pattern: str`（glob 模式，如 `\"**/*.py\"`、`\"src/test_*.py\"`）、`max_results: int = 100`（ge=1）。\n- [ ] side_effect == READ_ONLY。\n- [ ] execute 语义：调 `sandbox.list_files(pattern)`，截断到 max_results 条，标记 truncated。\n- [ ] 成功时 data 含 `{\"paths\": [...], \"count\": N, \"truncated\": bool}`。\n- [ ] 路径越界（list_files 抛 PermissionError）→ PERMISSION_DENIED。\n- [ ] 单元测试（参照 test_coding_tools.py 风格，通过 ToolExecutor 驱动）：\n  - side_effect == READ_ONLY。\n  - 基础匹配：workspace 有 a.py / b.txt / c.py → pattern=\"*.py\" 返回 [a.py, c.py]。\n  - 递归 `**`：嵌套子目录里的文件被匹配。\n  - 无匹配返回空列表、count=0、truncated=False。\n  - max_results 截断：匹配数 > max_results 时 truncated=True 且 count==max_results。\n  - 路径越界 → PERMISSION_DENIED。\n  - 参数类型错（pattern 非 str）→ INVALID_ARGUMENT。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\n- #12（Ticket 1：Sandbox list_files 方法必须先落地，glob 直接依赖它）。\n",
+      "closedAt": "2026-09-03T13:26:53Z",
+      "createdAt": "2026-09-03T13:01:40Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 16,
+      "state": "CLOSED",
+      "title": "Ticket 5: glob Coding Tool（glob 模式文件匹配 + 截断）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n实现 grep Coding Tool：在 workspace 文件内容里做正则搜索，返回文件路径、行号、匹配行文本。Agent 用它定位函数定义、TODO、错误信息等。调 Sandbox.list_files 枚举（Ticket 1），对每个文件 read_text 逐行 `re.search`，收集匹配。支持 include glob 过滤文件名、path 子树限定范围、max_results 截断防爆炸。坏正则映射 INVALID_ARGUMENT；二进制/编码失败文件跳过不算错。READ_ONLY。\n\n## Acceptance criteria\n\n- [ ] GrepTool 类：name=\"grep\"，构造时绑定 Sandbox。\n- [ ] 参数 schema：`pattern: str`（正则）、`path: str = \".\"`（搜索范围子目录，相对 workspace）、`include: str = \"*\"`（文件名 glob 过滤）、`max_results: int = 100`（ge=1）。\n- [ ] side_effect == READ_ONLY。\n- [ ] execute 语义：\n  1. `re.compile(pattern)`——坏正则抛异常 → failure(INVALID_ARGUMENT)。\n  2. 调 `sandbox.list_files(\"**/\" + include)`（或限定 path 子树），拿到候选文件列表。\n  3. 对每个文件 read_text，逐行 `regex.search(line)`，收集 `{path, line_number, line}`。\n  4. read_text 抛 UnicodeDecodeError（二进制文件）→ 跳过该文件，不算错误。\n  5. 匹配数达 max_results → 停止扫描，truncated=True。\n- [ ] 成功时 data 含 `{\"matches\": [{path, line_number, line}, ...], \"count\": N, \"truncated\": bool}`。\n- [ ] 路径越界（list_files 抛 PermissionError）→ PERMISSION_DENIED。\n- [ ] 单元测试（参照 test_coding_tools.py 风格，通过 ToolExecutor 驱动）：\n  - side_effect == READ_ONLY。\n  - 基础正则搜索：workspace 有文件含 \"def foo(\" → pattern=\"def (\\w+)\" 匹配，返回含 path/line_number/line。\n  - 多文件多匹配：行号正确、line 是匹配行全文。\n  - include 过滤：pattern 匹配但 include=\"*.py\" 时 .txt 文件被跳过。\n  - path 子树限定：只在指定子目录里搜。\n  - 坏正则（如 `[unclosed`）→ INVALID_ARGUMENT。\n  - max_results 截断：构造 >100 匹配，count==100 且 truncated=True。\n  - 空 workspace → count=0、matches=[]、truncated=False。\n  - 二进制文件（写些不可解码字节）→ 被跳过，不影响其他文件匹配、不报错。\n  - 参数类型错 → INVALID_ARGUMENT。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\n- #12（Ticket 1：Sandbox list_files 方法必须先落地，grep 直接依赖它枚举文件）。\n",
+      "closedAt": "2026-09-03T13:26:57Z",
+      "createdAt": "2026-09-03T13:02:20Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 17,
+      "state": "CLOSED",
+      "title": "Ticket 6: grep Coding Tool（正则内容搜索 + 截断 + 二进制跳过）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#11 — Phase 3 Spec: 剩余 6 个 Coding Tools\n\n## What to build\n\n集成收尾 ticket：把 6 个新 Coding Tool（edit / glob / grep / apply_patch / git_status / git_diff）接入工具注册导出和集成测试 fixture，并验证批次调度在新工具上行为正确（纯 READ_ONLY 批可并发，含 MUTATING 的批串行）。这是把 Ticket 1-6 的孤立实现缝合进项目的 vertical 切片，确保它们和 read/write/bash 在 ToolExecutor 下表现一致。\n\n## Acceptance criteria\n\n- [ ] `tools/__init__.py` 导出全部 9 个 Coding Tool 类（read/write/bash + edit/glob/grep/apply_patch/git_status/git_diff）。\n- [ ] `tests/agent/test_integration_coding.py` 的 `_make_runtime` fixture 注册全部 9 个 Coding Tools（之前只注册 3 个）。\n- [ ] 批次调度验证测试（追加到 `tests/tools/test_coding_tools.py` 的 TestBatchScheduling 或新类）：\n  - 纯 READ_ONLY 批（如多个 glob 调用）→ execute_batch 返回全部成功、tool_call_id 配对正确。\n  - 混合批（如 git_status[READ_ONLY] + edit[MUTATING]）→ 整批串行执行、全部成功、结果顺序正确。\n  - 全 MUTATING 批（如多个 edit）→ 串行、全部成功。\n- [ ] 每个新工具的 side_effect 分类断言（edit=MUTATING, glob=READ_ONLY, grep=READ_ONLY, apply_patch=MUTATING, git_status=READ_ONLY, git_diff=READ_ONLY）至少在一个测试里显式断言过（可在各工具自己的测试里已有，本 ticket 汇总确认）。\n- [ ] `pytest -q` 全绿（含原有测试 + Ticket 1-6 新增测试）。\n- [ ] `ruff check .` 无新增告警。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\n- #13（Ticket 2: edit）\n- #14（Ticket 3: apply_patch）\n- #15（Ticket 4: git_status + git_diff）\n- #16（Ticket 5: glob）\n- #17（Ticket 6: grep）\n\n（#12 list_files 是 Ticket 5/6 的前置，间接被覆盖，不单独列。）\n",
+      "closedAt": "2026-09-03T13:27:00Z",
+      "createdAt": "2026-09-03T13:03:00Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 18,
+      "state": "CLOSED",
+      "title": "Ticket 7: 全工具注册导出 + 集成 fixture + 批次调度验证"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\nPhase 3 的 9 个 Coding Tool 已全部落地，但 `05_SANDBOX_CODING_TOOLS.md` §6 要求的三层 Permission Policy（read-only / workspace-write / danger-full-access）和 REQUIRE_APPROVAL 机制尚未实现。当前 ToolExecutor 的验证链只有 lookup → validate → execute，没有任何授权关卡。模型的 bash 调用（可能是 `rm -rf` 或网络命令）与 read 调用走完全相同的路径——没有机制让高风险操作在执行前请求人类批准。\n\n## Solution\n\n在 ToolExecutor 的验证链中插入一个 Approval 关卡（validate → **approval gate** → execute），由 PermissionPolicy 和 ApprovalRequest/ApprovalResponse 类型驱动。每个 Tool 声明自己的 permission 要求（默认 read-only），ToolExecutor 在执行前检查 Session 的当前 PermissionPolicy 是否允许；如果不允许或操作被标记为 REQUIRE_APPROVAL，则产生一个 ApprovalRequest，由可插拔的 ApprovalCallback 决定批准或拒绝。批准只针对当次 Tool Call，不永久放开后续命令。\n\n## User Stories\n\n1. 作为配置者，我想给 Session 设定一个 PermissionPolicy（read-only / workspace-write / danger-full-access），这样我能控制 Agent 在这个 Session 里的最大权限边界。\n2. 作为配置者，当 Policy 是 read-only 时，任何写操作（write/edit/apply_patch/bash）都会被拒绝，这样我能保证 Agent 不意外修改文件。\n3. 作为配置者，当 Policy 是 workspace-write 时，读和写操作都被允许，但危险操作（如某些 bash 命令）仍需要审批，这样我能让 Agent 自由工作但拦截高风险动作。\n4. 作为配置者，当 Policy 是 danger-full-access 时，所有操作都被允许且不需要审批，这样我能在可信环境里让 Agent 全自动运行。\n5. 作为人类审查者，当一个高风险 Tool Call 需要审批时，我想收到一个 ApprovalRequest（包含工具名、参数、风险原因），这样我能判断是否批准。\n6. 作为人类审查者，当我批准一次 Tool Call 时，批准只对这一次调用生效，下次同样的命令仍需要重新审批，这样不会有\"一次批准永久开放\"的安全漏洞。\n7. 作为人类审查者，当我拒绝一次 Tool Call 时，Agent 收到一个 PERMISSION_DENIED 的 ToolResult 并能据此调整策略。\n8. 作为开发者，我想提供一个自定义的 ApprovalCallback（如 CLI 交互、Web UI 弹窗、自动批准测试环境），这样审批接口能适配不同部署形态。\n9. 作为开发者，当没有提供 ApprovalCallback 时，REQUIRE_APPROVAL 的工具默认被拒绝（安全默认值），这样系统不会因为缺回调而静默放行危险操作。\n10. 作为开发者，我想 Tool 声明 permission 级别通过一个新属性而非复用 side_effect，因为 side_effect 是调度分类（并发/串行），permission 是授权分类——它们是正交关注点。\n11. 作为开发者，我想所有 Tool（内置、未来 MCP、未来 Plugin）都经过同一个 Approval 关卡，这样没有工具能绕过授权（不变量 #7 的延伸）。\n\n## Implementation Decisions\n\n### 新增 PermissionPolicy 枚举\n\n```python\nclass PermissionPolicy(str, Enum):\n    READ_ONLY = \"read-only\"              # 只允许 read-only 工具\n    WORKSPACE_WRITE = \"workspace-write\"  # 允许 read + workspace-write，danger 需审批\n    DANGER_FULL_ACCESS = \"danger-full-access\"  # 全部允许，不需审批\n```\n\n### 新增 ToolPermission 枚举（Tool 的授权分类，正交于 side_effect）\n\n```python\nclass ToolPermission(str, Enum):\n    READ_ONLY = \"read-only\"            # 读操作：read/grep/glob/git_status/git_diff\n    WORKSPACE_WRITE = \"workspace-write\" # workspace 内写：write/edit/apply_patch\n    DANGER = \"danger\"                   # 高风险：bash（可配网络/系统副作用）\n```\n\n### Tool 契约扩展\n\nTool ABC 新增可选属性 `permission`，默认返回 `ToolPermission.WORKSPACE_WRITE`（安全偏高，避免新工具默认 DANGER）。已有工具覆写：\n- read/grep/glob/git_status/git_diff → READ_ONLY\n- write/edit/apply_patch → WORKSPACE_WRITE\n- bash → DANGER\n\nside_effect 和 permission 是正交的：side_effect 驱动调度（并发/串行），permission 驱动授权（允许/审批/拒绝）。\n\n### ApprovalRequest / ApprovalResponse\n\n```python\n@dataclass(frozen=True)\nclass ApprovalRequest:\n    tool_name: str\n    args: dict\n    permission: ToolPermission\n    policy: PermissionPolicy\n    reason: str  # 为什么需要审批（如 \"bash 命令属于 DANGER 级别\"）\n\n@dataclass(frozen=True)\nclass ApprovalResponse:\n    approved: bool\n    reason: str = \"\"\n```\n\n### ApprovalCallback 类型\n\n```python\nApprovalCallback = Callable[[ApprovalRequest], ApprovalResponse]\n```\n\n可插拔：CLI 交互、Web UI、自动批准、自动拒绝。不提供时默认拒绝（安全默认值）。\n\n### ToolExecutor 集成\n\n`ToolExecutor.execute()` 在 validate 之后、execute 之前插入 approval gate：\n1. 取 tool.permission 和 session 当前 policy。\n2. 如果 policy == DANGER_FULL_ACCESS → 放行。\n3. 如果 tool.permission 级别 <= policy 级别 → 放行（READ_ONLY <= WORKSPACE_WRITE <= DANGER）。\n4. 否则（tool.permission 超出 policy 或两者都是 DANGER 级别但 policy 是 WORKSPACE_WRITE）→ 需要 approval：\n   - 无 callback → PERMISSION_DENIED（安全默认）。\n   - 有 callback → 调 callback；approved → 放行；denied → PERMISSION_DENIED。\n5. 批准只影响当次 execute 调用，不存储任何状态（per-call scoping 由设计保证——每次 execute 都独立检查）。\n\n### ToolExecutor 构造变化\n\n```python\nclass ToolExecutor:\n    def __init__(self, registry, *, policy=PermissionPolicy.WORKSPACE_WRITE, approval_callback=None):\n        ...\n```\n\npolicy 和 approval_callback 是可选的，有安全默认值（policy=WORKSPACE_WRITE，callback=None→拒绝 danger）。\n\n### 不改的东西\n\n- ToolResult / ErrorCode 不新增码——审批拒绝映射现有 PERMISSION_DENIED。\n- Tool 契约的 side_effect / args_schema / execute 签名不变——只新增可选属性。\n- 批次调度（execute_batch）不变——approval gate 在单 tool execute 层，batch 只是对 execute 的并发/串行包装。\n\n## Testing Decisions\n\n### 测试缝\n\n复用现有唯一测试缝：`LocalSubprocessSandbox` + `ToolRegistry` + `ToolExecutor.execute(tool_call dict)` + 断言 `ToolResult`。\n\n### 什么算好测试\n\n- **不变量优先**：per-call scoping（连续两次同样的 danger 调用，第二次仍需审批）、安全默认值（无 callback → danger 被拒绝）、policy 级别层级（READ_ONLY 工具在 READ_ONLY policy 下放行）。\n- **审批回调**：提供 auto-approve callback → danger 工具执行成功；提供 auto-deny → PERMISSION_DENIED。\n- **已有工具分类**：read=READ_ONLY, write=WORKSPACE_WRITE, bash=DANGER。\n- **回归**：现有 202 个测试不受影响（默认 policy=WORKSPACE_WRITE 时，read/write 正常工作，只有 bash 需要 approval——需要确认现有测试中 bash 的使用不会被审批拦截）。\n\n### 具体测试\n\n- `tests/tooling/test_permission.py`：\n  - PermissionPolicy + ToolPermission 级别比较。\n  - Tool ABC 默认 permission = WORKSPACE_WRITE。\n  - 各 Coding Tool 的 permission 断言（read=READ_ONLY, write=WORKSPACE_WRITE, edit=WORKSPACE_WRITE, bash=DANGER, glob=READ_ONLY, grep=READ_ONLY, git_status=READ_ONLY, git_diff=READ_ONLY, apply_patch=WORKSPACE_WRITE）。\n- `tests/tooling/test_approval_gate.py`：\n  - DANGER_FULL_ACCESS policy → bash 无审批放行。\n  - WORKSPACE_WRITE policy + bash(DANGER) + 无 callback → PERMISSION_DENIED。\n  - WORKSPACE_WRITE policy + bash(DANGER) + auto-approve callback → 执行成功。\n  - WORKSPACE_WRITE policy + bash(DANGER) + auto-deny callback → PERMISSION_DENIED。\n  - READ_ONLY policy + write(WORKSPACE_WRITE) → PERMISSION_DENIED（超级别）。\n  - READ_ONLY policy + read(READ_ONLY) → 放行。\n  - WORKSPACE_WRITE policy + read(READ_ONLY) → 放行。\n  - WORKSPACE_WRITE policy + write(WORKSPACE_WRITE) → 放行。\n  - **per-call scoping**：连续两次 bash(DANGER) + auto-approve → 两次都成功（callback 被调用两次，不是一次批准后第二次跳过）。\n\n## Out of Scope\n\n- **Dangerous bash 命令模式匹配**（如检测 `rm -rf` / `curl` / `wget`）：V1 把整个 bash 工具标记为 DANGER，不做命令内容级分类。后者作为未来增强。\n- **审批事件的 SessionEvent 持久化**（approval/requested, approval/granted, approval/denied 事件）：属 Phase 4 Operation Ledger / 审计日志范畴，本 Spec 不实现。审批是运行时内存决策。\n- **Web UI / CLI 审批界面**：本 Spec 只定义 ApprovalCallback 接口和 ApprovalRequest/Response 类型，不实现具体 UI。测试用 auto-approve/auto-deny callback。\n- **MCP / Plugin 工具的 permission 声明**：Phase 7/8 的工具如何声明 permission 留待那些 Phase 解决；本 Spec 只保证 Tool ABC 有默认值，所有经过 ToolExecutor 的工具都过 approval gate。\n\n## Further Notes\n\n- **架构不变量守护**：所有工具经过统一 ToolExecutor 路径（#7），approval gate 加在这条路径上，没有旁路。Prompt 不替代 Runtime 权限（#11 的延伸）：approval 是代码级关卡，不靠 prompt 约束模型。\n- **与 Phase 4 的关系**：审批是运行时内存决策，不持久化。如果 Phase 4 要做审批审计，可以在 approval gate 里追加 SessionEvent append，但本 Spec 不做。\n- **安全默认值原则**：无 callback → 拒绝（不放行）；新工具默认 WORKSPACE_WRITE（不默认 DANGER）；默认 policy = WORKSPACE_WRITE（不给 danger-full-access）。\n",
+      "closedAt": "2026-09-03T14:20:08Z",
+      "createdAt": "2026-09-03T13:42:01Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 19,
+      "state": "CLOSED",
+      "title": "Phase 3 Spec: Approval / REQUIRE_APPROVAL 机制（Permission Policy + 审批关卡）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\nPhase 3 的 Coding Tools 和 Sandbox 后端已全部落地，但 Session 与 Sandbox 之间没有绑定关系。`DockerSandbox` 在构造时生成随机 uuid 命名容器和 volume，只存内存——进程重启后无法根据 session_id 找回对应的 Sandbox。`05_SANDBOX_CODING_TOOLS.md` §2 和 `07_STORAGE_PERSISTENCE_RECOVERY.md` §9 要求的恢复顺序（load Session → load sandbox mapping → ensure sandbox started → ... → resume）在第二步就断了：没有 sandbox mapping 可以 load。\n\n`Session.resume()` 目前只修复 dangling tool_call 的消息链，不恢复 workspace。如果 Agent 在 DockerSandbox 里创建了文件然后进程崩溃，重启 resume 后 workspace 可能丢失（取决于容器是否还在），Agent 无法继续之前的工作。\n\n## Solution\n\n引入 `WorkspaceRegistry`——一个持久化的 Session↔Sandbox 映射表，记录每个 session 对应的 sandbox 元数据（后端类型、workspace_root 路径、Docker 容器名、volume 名）。Session 创建时注册映射，resume 时查回映射并重建 Sandbox 实例（复用已有容器/volume）。LocalSubprocessSandbox 的 workspace 是真实目录，天然持久；DockerSandbox 的容器可能在退出后停止但 volume 持久，resume 时重新启动容器即可恢复 workspace。\n\n这样 Session 的生命周期就与 Sandbox 绑定：start → 创建/注册 sandbox，resume → 查回/重启 sandbox，stop → 可选清理。恢复顺序的第二步（load sandbox mapping）不再是断点。\n\n**本 Spec 明确范围限定**：只实现 Session↔Sandbox 绑定 + 映射持久化 + resume 时 workspace 恢复。完整的 Operation Ledger / Checkpoint / reconcile / kill tests 属于 Phase 4 后续工作，依赖 Storage 抽象（SQLite/Postgres），不在本 Spec 范围。\n\n## User Stories\n\n1. 作为 Agent Runtime，当一个新 Session 开始时，我想自动创建/注册一个 Sandbox 实例并记录映射，这样这个 Session 的所有 Tool 调用都绑定到同一个 workspace。\n2. 作为 Agent Runtime，当一个 Session resume 时，我想根据 session_id 查回之前的 Sandbox 映射并重建 Sandbox 实例，这样 workspace 里之前创建的文件还在。\n3. 作为开发者，我想 WorkspaceRegistry 的映射持久化到磁盘（JSON 文件，与 Session JSONL 同级），这样进程重启后映射不丢。\n4. 作为开发者，我想 LocalSubprocessSandbox 的 workspace 在 resume 时天然恢复（目录就在磁盘上），这样本地开发不需要额外恢复逻辑。\n5. 作为开发者，我想 DockerSandbox 的容器在 resume 时被重新启动（如果已停止）并复用原有 volume，这样容器内的 workspace 文件不丢。\n6. 作为开发者，我想 DockerSandbox 的容器名和 volume 名是确定性的（基于 session_id 而非随机 uuid），这样映射表能用 session_id 查回正确的容器。\n7. 作为配置者，我想能选择 Sandbox 后端（local 或 docker），这样开发时用 local、生产用 docker。\n8. 作为开发者，当一个 Session 显式结束时，我想能选择是否清理 Sandbox（保留 volume 还是删除），这样 workspace 可以跨 session 复用或按需清理。\n9. 作为开发者，我想 WorkspaceRegistry 的接口足够简洁（create / get / stop / delete），这样未来 Phase 4 的 Operation Ledger 和 reconcile 能建立在它之上。\n\n## Implementation Decisions\n\n### WorkspaceRegistry\n\n```python\nclass WorkspaceRegistry:\n    \"\"\"Session ↔ Sandbox 映射表的持久化管理。\"\"\"\n\n    def __init__(self, root: Path, backend: str = \"local\"):\n        \"\"\"root 是映射表和 workspace 的根目录。backend='local'|'docker'。\"\"\"\n\n    def create(self, session_id: str) -> Sandbox:\n        \"\"\"为新 session 创建 Sandbox 实例，持久化映射，返回已 ensure_started 的 Sandbox。\"\"\"\n\n    def get(self, session_id: str) -> Sandbox:\n        \"\"\"查回 session 的 Sandbox 实例（必要时重建并 ensure_started）。\"\"\"\n\n    def stop(self, session_id: str) -> None:\n        \"\"\"停止 session 的 Sandbox（容器停但不删 volume）。幂等。\"\"\"\n\n    def delete(self, session_id: str) -> None:\n        \"\"\"彻底清理 session 的 Sandbox 和映射。幂等。\"\"\"\n\n    def exists(self, session_id: str) -> bool:\n        \"\"\"检查 session 是否有映射记录。\"\"\"\n```\n\n### 映射持久化格式\n\n映射表存为 `<root>/workspaces/<session_id>.json`：\n\n```json\n{\n    \"session_id\": \"sess_xxx\",\n    \"backend\": \"local\",\n    \"workspace_root\": \"/path/to/workspaces/sess_xxx\",\n    \"container_name\": null,\n    \"volume_name\": null,\n    \"created_at\": \"2026-09-03T...\"\n}\n```\n\nLocalSubprocessSandbox：workspace_root 是真实路径，container_name/volume_name 为 null。\nDockerSandbox：container_name 和 volume_name 基于 session_id 确定性生成（如 `agent-harness-{session_id}`）。\n\n### DockerSandbox 命名确定性化\n\nDockerSandbox 的 `__init__` 从接受随机 uuid 改为接受确定性名称（由 WorkspaceRegistry 传入基于 session_id 的名称）。已有的随机命名行为保留为 fallback（直接构造 DockerSandbox 不经过 Registry 时仍可用）。\n\n### Session 集成\n\n`Session.start()` 和 `Session.resume()` 新增可选参数 `workspace_registry: WorkspaceRegistry | None`：\n- 提供 registry 时：start 调 registry.create()，resume 调 registry.get()，Session 持有 Sandbox 引用。\n- 不提供时：行为不变（向后兼容，现有测试不受影响）。\n\nSession 不直接管理 Sandbox 的完整生命周期（stop/delete 是 Registry 的职责），但 Session 提供 `sandbox` 属性供 Runtime 访问。\n\n### AgentRuntime 集成\n\nAgentRuntime 的 Sandbox 注入方式不变（构造时传入）。当通过 WorkspaceRegistry 管理 Sandbox 时，由调用方（CLI 或上层编排）负责从 Registry 获取 Sandbox 并传给 Runtime。本 Spec 不改 Runtime 内部——只提供 Registry 基础设施。\n\n### 目录结构\n\n```\n<root>/\n├── sessions/\n│   └── <session_id>/\n│       └── events.jsonl          # 已有：JsonlSessionStore\n└── workspaces/\n    ├── <session_id>.json         # 新增：WorkspaceRegistry 映射\n    └── <session_id>/             # 新增：LocalSubprocessSandbox workspace 目录\n        └── ... (Agent 创建的文件)\n```\n\n### 不改的东西\n\n- Sandbox ABC 契约不变（已有 7 个方法足够）。\n- Tool 契约不变。\n- ToolExecutor 不变。\n- Session 的 events.jsonl 读写逻辑不变。\n- JsonlSessionStore 不变。\n\n## Testing Decisions\n\n### 测试缝\n\n复用现有测试缝 + 新增 WorkspaceRegistry 直接测试：\n- `tests/sandbox/test_workspace_registry.py`：直接调 Registry API + 断言 Sandbox 行为。\n- `tests/session/test_session_workspace.py`：Session + Registry 集成（start/resume 绑定 sandbox）。\n\n### 什么算好测试\n\n- **映射持久化**：create 后 JSON 文件存在且内容正确；进程重启后（模拟：新 Registry 实例同 root）get 能查回。\n- **workspace 恢复**：create → 在 workspace 写文件 → 新 Registry 实例 get → 文件还在。\n- **确定性命名**：同一 session_id 两次 create 产生的 Docker 容器名相同（不测真实 Docker，测名称生成逻辑）。\n- **幂等性**：stop/delete 多次不报错。\n- **向后兼容**：不传 registry 时 Session 行为完全不变（现有测试全绿）。\n\n### 具体测试\n\n- `tests/sandbox/test_workspace_registry.py`（LocalSubprocessSandbox 后端）：\n  - create → 返回已 ensure_started 的 Sandbox，workspace_root 存在。\n  - create → 映射 JSON 文件存在。\n  - get（同 Registry 实例）→ 返回同一个 Sandbox 实例。\n  - get（新 Registry 实例，模拟重启）→ 重建 Sandbox，workspace_root 与之前一致。\n  - workspace 恢复：create → write 文件 → 新 Registry get → read 文件内容正确。\n  - exists：未 create → False；create → True。\n  - stop：调用后幂等（LocalSubprocess 是 no-op）。\n  - delete：映射文件删除、workspace 目录可选保留。\n  - backend='local' → 返回 LocalSubprocessSandbox 实例。\n- `tests/sandbox/test_workspace_registry_docker.py`（DockerSandbox 后端，@integration + skipif Docker）：\n  - 容器名/volume 名基于 session_id 确定性。\n  - workspace 恢复：create → write → stop → get（重启容器）→ 文件还在。\n- `tests/session/test_session_workspace.py`：\n  - Session.start(registry) → session.sandbox 不是 None。\n  - Session.resume(registry) → session.sandbox 恢复，workspace 文件还在。\n  - 不传 registry → session.sandbox 是 None，现有行为不变。\n\n## Out of Scope\n\n- **Operation Ledger**（Phase 4）：per-operation 状态机、args_hash、result_ref、reconcile 元数据——属 Phase 4 Storage 抽象。\n- **Checkpoint**（Phase 4）：稳定边界的可恢复事实持久化、event+checkpoint 事务提交——属 Phase 4。\n- **Reconcile 逻辑**（Phase 4）：SUCCEEDED-but-missing-result 合成、UNKNOWN/NEED_RECONCILE 处理、tool-specific recovery——属 Phase 4，需要 Operation Ledger。\n- **Kill tests**（Phase 4）：真实进程杀死 + 恢复的验收测试——属 Phase 4 Gate。\n- **Workspace import 流程**（05 §3）：从宿主项目目录显式 copy 到 Docker volume 的结构化流程——已有 copy_in 原语，完整 import flow 留后续。\n- **Multi-agent workspace 共享**（05 §2）：同一 workspace 不同 Tool Permission 的多 Agent——属 Phase 13。\n- **SQLite/Postgres 存储**（Phase 4）：本 Spec 映射表用 JSON 文件，足够 Phase 3 的绑定需求。升级到 SQL 存储是 Phase 4 的 Storage 抽象决策。\n\n## Further Notes\n\n- **架构不变量守护**：Sandbox 是 Runtime 安全边界（#11），Registry 只管理 Sandbox 生命周期，不改 Sandbox 路径边界。Checkpoint 不等于副作用恢复（#12）——本 Spec 不引入 Checkpoint，workspace 恢复靠 Sandbox 后端的持久性（Local 目录天然持久，Docker volume 持久），不靠 checkpoint 回放。\n- **与 Phase 4 的衔接**：本 Spec 的 WorkspaceRegistry 是 Phase 4 恢复顺序第 2 步（load sandbox mapping）的实现。Phase 4 的 Operation Ledger / Checkpoint / reconcile 在此基础上加层，不需要重构 Registry。\n- **Reuse First**：映射表用 JSON 文件（与 SessionStore 的 JSONL 同级技术），不引入 SQLite/Postgres。Docker volume 复用已有 DockerSandbox 的 volume 机制（已实现），只改命名从随机到确定性。\n- **安全**：WorkspaceRegistry 不改变 Sandbox 的路径边界强制。workspace 目录在 Registry root 下，Agent 即使尝试路径穿越也被 Sandbox._resolve_within_workspace 拦截。\n",
+      "closedAt": "2026-09-03T14:20:12Z",
+      "createdAt": "2026-09-03T13:42:04Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 20,
+      "state": "CLOSED",
+      "title": "Phase 3 Spec: Session-scoped Sandbox 生命周期（WorkspaceRegistry + 映射持久化 + resume 恢复）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#19 — Phase 3 Spec: Approval / REQUIRE_APPROVAL 机制\n\n## What to build\n\n新增 PermissionPolicy（read-only / workspace-write / danger-full-access）和 ToolPermission（read-only / workspace-write / danger）两个枚举，给 Tool ABC 扩展可选 `permission` 属性（默认 WORKSPACE_WRITE），让 9 个已有 Coding Tool 声明各自的 permission 级别。这是审批关卡的地基——ToolExecutor 需要知道每个工具的授权级别才能做策略检查。\n\n## Acceptance criteria\n\n- [ ] `PermissionPolicy` 枚举（READ_ONLY / WORKSPACE_WRITE / DANGER_FULL_ACCESS）在 `tooling/contract.py` 或新文件中定义。\n- [ ] `ToolPermission` 枚举（READ_ONLY / WORKSPACE_WRITE / DANGER）定义。\n- [ ] Tool ABC 新增可选属性 `permission`，默认返回 `ToolPermission.WORKSPACE_WRITE`。\n- [ ] 各 Coding Tool 覆写 permission：read=READ_ONLY, grep=READ_ONLY, glob=READ_ONLY, git_status=READ_ONLY, git_diff=READ_ONLY, write=WORKSPACE_WRITE, edit=WORKSPACE_WRITE, apply_patch=WORKSPACE_WRITE, bash=DANGER。\n- [ ] side_effect 和 permission 正交：side_effect 驱动调度，permission 驱动授权。\n- [ ] 测试（`tests/tooling/test_permission.py`）：PermissionPolicy/ToolPermission 枚举值、Tool ABC 默认 permission、9 个工具的 permission 断言。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\nNone（can start immediately）。\n",
+      "closedAt": "2026-09-03T14:20:15Z",
+      "createdAt": "2026-09-03T13:43:20Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 21,
+      "state": "CLOSED",
+      "title": "Ticket A: PermissionPolicy + ToolPermission 枚举 + Tool 契约 permission 属性 + 各工具声明"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#19 — Phase 3 Spec: Approval / REQUIRE_APPROVAL 机制\n\n## What to build\n\n在 ToolExecutor 的验证链中插入 Approval 关卡（validate → approval gate → execute）。新增 ApprovalRequest / ApprovalResponse 数据类和 ApprovalCallback 类型。ToolExecutor 构造接受 policy 和 approval_callback（有安全默认值）。审批只对当次 Tool Call 生效，不持久化状态。无 callback 时 DANGER 级别默认拒绝。\n\n## Acceptance criteria\n\n- [ ] ApprovalRequest（tool_name, args, permission, policy, reason）和 ApprovalResponse（approved, reason）定义。\n- [ ] ApprovalCallback 类型别名定义。\n- [ ] ToolExecutor.__init__ 新增可选参数 `policy: PermissionPolicy = WORKSPACE_WRITE`、`approval_callback: ApprovalCallback | None = None`。\n- [ ] approval gate 逻辑（在 validate 后 execute 前）：\n  - DANGER_FULL_ACCESS → 放行。\n  - tool.permission 级别 <= policy 级别 → 放行。\n  - 超级别或 DANGER 在 WORKSPACE_WRITE 下 → 需要 approval：无 callback → PERMISSION_DENIED；有 callback → 调 callback，approved 放行 / denied → PERMISSION_DENIED。\n  - 批准只影响当次 execute（每次 execute 独立检查）。\n- [ ] 测试（`tests/tooling/test_approval_gate.py`）：\n  - DANGER_FULL_ACCESS → bash 放行。\n  - WORKSPACE_WRITE + bash + 无 callback → PERMISSION_DENIED。\n  - WORKSPACE_WRITE + bash + auto-approve → 成功。\n  - WORKSPACE_WRITE + bash + auto-deny → PERMISSION_DENIED。\n  - READ_ONLY + write → PERMISSION_DENIED。\n  - READ_ONLY + read → 放行。\n  - WORKSPACE_WRITE + read/write → 放行。\n  - per-call scoping：连续两次 bash + auto-approve → callback 被调两次，两次都成功。\n  - ApprovalRequest 包含正确的 tool_name/args/permission/policy/reason。\n- [ ] 现有测试回归：ToolExecutor 默认 policy=WORKSPACE_WRITE 时，现有测试中 bash 的使用需调整为提供 auto-approve callback 或 DANGER_FULL_ACCESS policy（否则 bash 被拒）。**注意**：这可能需要更新现有测试的 ToolExecutor 构造——评估影响并最小化改动。\n\n## Blocked by\n\n- #21（Ticket A：PermissionPolicy + ToolPermission 必须先定义）\n",
+      "closedAt": "2026-09-03T14:20:18Z",
+      "createdAt": "2026-09-03T13:43:23Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 22,
+      "state": "CLOSED",
+      "title": "Ticket B: ApprovalRequest/Response + ToolExecutor approval gate + per-call 审批"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#20 — Phase 3 Spec: Session-scoped Sandbox 生命周期\n\n## What to build\n\n实现 WorkspaceRegistry——Session↔Sandbox 映射表的持久化管理。支持 LocalSubprocessSandbox 后端：create 为新 session 创建 workspace 目录 + 写映射 JSON，get 查回/重建 Sandbox（workspace 是真实目录天然持久），stop/delete 清理。映射存为 `<root>/workspaces/<session_id>.json`。这是 Session-scoped Sandbox 生命周期的基础——让进程重启后能根据 session_id 找回 workspace。\n\n## Acceptance criteria\n\n- [ ] WorkspaceRegistry 类在 `sandbox/registry.py` 定义，构造接受 `root: Path` 和 `backend: str = \"local\"`。\n- [ ] create(session_id) → 创建 workspace 目录 + 写映射 JSON + 返回已 ensure_started 的 Sandbox。\n- [ ] get(session_id) → 返回 Sandbox 实例（同进程内缓存；不存在时从 JSON 重建）。\n- [ ] exists(session_id) → bool。\n- [ ] stop(session_id) → 停止 Sandbox（LocalSubprocess 是 no-op），幂等。\n- [ ] delete(session_id) → 删映射 JSON + 可选删 workspace 目录，幂等。\n- [ ] 映射 JSON 格式：session_id / backend / workspace_root / container_name / volume_name / created_at。\n- [ ] 测试（`tests/sandbox/test_workspace_registry.py`，LocalSubprocess 后端）：\n  - create → Sandbox 实例 + workspace_root 存在 + JSON 文件存在。\n  - get（同实例）→ 同一 Sandbox。\n  - get（新实例，模拟重启）→ 重建 Sandbox，workspace_root 一致。\n  - workspace 恢复：create → write 文件 → 新 Registry get → 文件还在。\n  - exists / stop 幂等 / delete 幂等。\n  - backend='local' → LocalSubprocessSandbox 实例。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\nNone（can start immediately）。\n",
+      "closedAt": "2026-09-03T14:20:22Z",
+      "createdAt": "2026-09-03T13:44:33Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 23,
+      "state": "CLOSED",
+      "title": "Ticket C: WorkspaceRegistry + LocalSubprocess 后端 + 映射持久化 + 契约测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#20 — Phase 3 Spec: Session-scoped Sandbox 生命周期\n\n## What to build\n\n给 WorkspaceRegistry 增加 DockerSandbox 后端支持，并把 DockerSandbox 的容器名/volume 名从随机 uuid 改为基于 session_id 的确定性命名。这样 Docker 后端的 workspace 也能跨进程恢复——容器停了但 volume 在，resume 时用确定性名字重启容器即可恢复 workspace。\n\n## Acceptance criteria\n\n- [ ] DockerSandbox.__init__ 支持确定性命名：当 WorkspaceRegistry 创建时传入基于 session_id 的 container_name 和 volume_name（如 `agent-harness-{session_id}`），不再随机 uuid。直接构造（不经 Registry）仍保留随机 fallback。\n- [ ] WorkspaceRegistry.create(session_id, backend='docker') → 创建确定性命名的 DockerSandbox + 写映射 JSON。\n- [ ] WorkspaceRegistry.get(session_id) docker 后端 → 重建 DockerSandbox（用映射 JSON 里的容器名/volume 名）+ ensure_started（重启已停容器）。\n- [ ] WorkspaceRegistry.stop(session_id) docker → 容器 stop（不删 volume）。\n- [ ] workspace 恢复（docker）：create → write 文件 → stop → get → 文件还在（volume 持久性）。\n- [ ] 测试（`tests/sandbox/test_workspace_registry_docker.py`，@integration + skipif Docker 不可用）：\n  - 确定性命名：同一 session_id 的容器名一致。\n  - workspace 恢复：write → stop → get → read 文件正确。\n  - 映射 JSON 含 container_name / volume_name。\n- [ ] 所有现有测试仍通过（Docker 测试默认 skip）。\n\n## Blocked by\n\n- #23（Ticket C：WorkspaceRegistry 必须先实现 LocalSubprocess 版本）\n",
+      "closedAt": "2026-09-03T14:20:25Z",
+      "createdAt": "2026-09-03T13:44:36Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 24,
+      "state": "CLOSED",
+      "title": "Ticket D: DockerSandbox 确定性命名 + WorkspaceRegistry Docker 后端 + 恢复测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#20 — Phase 3 Spec: Session-scoped Sandbox 生命周期\n\n## What to build\n\n把 WorkspaceRegistry 接入 Session 生命周期。Session.start 和 Session.resume 新增可选参数 workspace_registry：提供时自动 create/get Sandbox 并绑定到 session.sandbox 属性；不提供时行为不变（向后兼容）。这让 Agent Runtime 能通过 Session 访问绑定的 Sandbox，实现 Session-scoped 的 workspace 管理。\n\n## Acceptance criteria\n\n- [ ] Session.start() 新增可选参数 `workspace_registry: WorkspaceRegistry | None = None`。提供时调 registry.create(session_id) 绑定 sandbox。\n- [ ] Session.resume() 新增同名可选参数。提供时调 registry.get(session_id) 恢复 sandbox。\n- [ ] Session 新增只读属性 `sandbox: Sandbox | None`（不传 registry 时为 None）。\n- [ ] 不传 registry 时 Session 行为完全不变（向后兼容，现有测试全绿）。\n- [ ] 测试（`tests/session/test_session_workspace.py`）：\n  - Session.start(registry) → session.sandbox 不是 None，workspace_root 存在。\n  - Session.resume(registry) → session.sandbox 恢复，workspace 文件还在。\n  - 不传 registry → session.sandbox 是 None。\n  - Session.start(registry) → write 文件 → Session.resume(registry) → sandbox.read_text 读到文件。\n- [ ] 所有现有测试仍通过。\n\n## Blocked by\n\n- #23（Ticket C：WorkspaceRegistry 必须先落地）\n",
+      "closedAt": "2026-09-03T14:20:29Z",
+      "createdAt": "2026-09-03T13:45:03Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 25,
+      "state": "CLOSED",
+      "title": "Ticket E: Session 集成 WorkspaceRegistry（start/resume 绑定 sandbox）+ 测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\n当 Agent 执行到一半进程崩溃时（如执行了一个 `write` 或 `bash` 后、把结果写回 SessionEvent 之前），重启后系统无法判断那个 Tool 到底执行成功了没有——副作用可能已经发生（文件已写、命令已跑），但 SessionEvent 序列里只有 `tool/call` 没有配对的 `tool/result`。当前 Phase 1 的 dangling 检测只能注入\"结果未知\"占位，模型被迫盲猜，可能导致重复执行已成功的副作用（文件写两遍、命令跑两次）或跳过本该完成的操作。\n\n用户（开发者）需要一个能从崩溃中精确恢复的 Harness：知道每个 Tool 调用到底到了哪一步，据此合成正确的恢复结果，而不是盲猜或重复执行。\n\n## Solution\n\n引入 **Operation Ledger**（独立于 SessionEvent 的操作状态账本）+ **Checkpoint**（稳定边界快照）+ **RecoveryCoordinator**（恢复编排器），实现崩溃后的精确恢复：\n\n- 每次 Tool 执行前，状态写入 Ledger（PENDING→RUNNING）；执行后写入终态（SUCCEEDED/FAILED/CANCELLED）。\n- Ledger 先于 SessionEvent 写入（Ledger-first 顺序），保证 Ledger 永远比 SessionEvent 更完整。\n- 崩溃后 resume 时，RecoveryCoordinator 读 Ledger 查每个未终止 Operation 的真实结局，按终态语义合成 Recovery ToolResult 注入 SessionEvent（而非注入\"结果未知\"占位）。\n- UNKNOWN（崩溃时处于 RUNNING）的 Operation 不盲重跑，走 ReconcileCallback 交用户裁决。\n\n## User Stories\n\n### Storage 架构\n\n1. As a developer, I want SessionEvent 保持 JSONL 存储不变, so that Phase 1 已稳定的崩溃安全写入不需要迁移\n2. As a developer, I want Operation Ledger 和 Checkpoint 用 SQLite 存储, so that 操作状态查询有索引支持且事务语义清晰\n3. As a developer, I want 三个 Store 接口分离（SessionStore / OperationLedger / CheckpointStore / SessionMetaStore）, so that 逻辑职责清晰且各自独立演化\n4. As a developer, I want 三个 Store 物理上共享同一个 SQLite 文件, so that 文件管理简单且跨表查询方便\n5. As a developer, I want Store 接口 ABC 化（SQLite 版今天实装，PostgreSQL 版留空）, so that 未来切换数据库只需替换实现\n6. As a developer, I want Ledger 使用 aiosqlite 异步驱动, so that 不阻塞 event loop\n\n### Operation Ledger\n\n7. As a developer, I want 每次 Tool 执行在 execute() 入口写 PENDING, so that Ledger 记录\"即将执行\"\n8. As a developer, I want 进入 retry_loop 前写 RUNNING, so that Ledger 记录\"正在执行\"\n9. As a developer, I want retry_loop 结束后写 SUCCEEDED/FAILED/CANCELLED, so that Ledger 记录 operation 最终态\n10. As a developer, I want Ledger 不记录 retry 中间的失败, so that Ledger 记录数 = operation 数（retry 走 Diagnostic Log）\n11. As a developer, I want operation_id = tool_call_id（1:1）, so that batch 并行调用也能唯一定位每个 operation\n12. As a developer, I want Ledger 表含 07 §4 冻结的最小字段集 + artifact_ref nullable 列, so that Phase 5 不需要 schema migration\n\n### Checkpoint\n\n13. As a developer, I want AgentRuntime 在 4 个稳定边界（USER_ACCEPTED / MODEL_COMPLETED / TOOL_BATCH_COMPLETED / FINAL_COMPLETED）写 Checkpoint, so that 系统知道安全恢复点\n14. As a developer, I want Checkpoint 通过 CheckpointPolicy 薄 seam 注入, so that 测试可换 NoCheckpoint / EveryStep 策略\n15. As a developer, I want checkpoint/saved 不进 SessionEvent, so that SessionEvent 只记对话事实不记存储动作\n\n### Reconcile\n\n16. As a developer, I want 崩溃后 resume 时 RecoveryCoordinator 读 Ledger 查未终止 Operation, so that 系统知道每个 Tool 到底到了哪一步\n17. As a developer, I want SUCCEEDED + 缺 ToolResult 的 Operation 从 Ledger 合成 Recovery ToolResult（复用原始 tool_call_id）, so that derive_messages 能配对 dangling tool_call\n18. As a developer, I want FAILED 的 Operation 合成失败 ToolResult, so that 模型看到失败可以自主决策\n19. As a developer, I want CANCELLED 的 Operation 合成显式取消 ToolResult, so that 模型知道这个操作被取消了\n20. As a developer, I want PENDING 的 Operation 按 PendingPolicy 处理（默认 skip 合成 skipped 结果）, so that 未启动的操作不被误重跑\n21. As a developer, I want UNKNOWN 的 Operation 不盲重跑, so that 不违反不变量 #14（高风险 Tool 不盲重跑）\n22. As a developer, I want UNKNOWN 的 Operation 走 ReconcileCallback 交用户裁决, so that 用户拿到 Tool 全上下文做出 informed decision\n23. As a developer, I want ReconcileCallback 与 ApprovalCallback 平行（不共用）, so that 事前授权和事后裁决语义不混淆\n24. As a developer, I want RecoveryCoordinator 进入 NEED_RECONCILE 时 append operation/reconcile-required SessionEvent, so that 模型在 resume 后能看到\"上次有 operation 需要人工裁决\"\n\n### Tool 层扩展\n\n25. As a developer, I want Tool ABC 新增 args_identity(args) 方法（默认全 args hash）, so that Ledger 的 args_hash 字段有统一来源\n26. As a developer, I want Tool ABC 新增 reconcile_hint(args, ledger_state) 方法（默认 verifiable=False）, so that ReconcileCallback 拿到 Tool 提供的验证建议\n27. As a developer, I want 可验证工具（read/write/edit/glob/grep/git_status/git_diff）覆写 reconcile_hint, so that 这些工具能提供\"检查文件是否存在\"等验证路径\n28. As a developer, I want bash 不覆写 reconcile_hint（默认 verifiable=False）, so that UNKNOWN bash 一律交用户\n\n### Resume 编排\n\n29. As a developer, I want RecoveryCoordinator 按 07 §9 冻结的 8 步顺序编排恢复, so that 恢复流程确定性\n30. As a developer, I want RecoveryCoordinator 注入 SessionStore + WorkspaceRegistry + OperationLedger + ReconcileCallback, so that 恢复所需组件全部可注入可测试\n31. As a developer, I want RecoveryCoordinator 暴露 recover(session_id) -> Session 单一方法, so that AgentRuntime 只需调一行\n32. As a developer, I want RecoveryCoordinator 自身失败时抛异常不写中间态, so that recovery 幂等可重试\n\n### 并发与失败\n\n33. As a developer, I want 两个进程同时 recover 同一 session 时用 pessimistic 锁保护, so that 不会产生双重恢复\n34. As a developer, I want Serial 批次里任一工具永久失败时中止剩余工具（记 CANCELLED）, so that 不在失败的副作用上叠加新副作用\n35. As a developer, I want Parallel 批次（全 READ_ONLY）单个失败不影响其他, so that 读操作天然独立\n36. As a developer, I want 每个工具独立事务（N 个 operations = N 次 commit）, so that 与单 execute() 行为一致\n\n### 运维\n\n37. As a developer, I want session_meta 表有 archived 标记 + 可选 cleanup(session_id) 方法, so that 已完成 session 可手动清理（不自动执行）\n\n## Implementation Decisions\n\n### 存储架构\n\n- **SessionEvent 保持 JSONL**：`JsonlSessionStore` 不迁移。Phase 1 已验证崩溃安全 + 135 测试覆盖。\n- **Operation Ledger + Checkpoint + SessionMeta 用 SQLite**：共享同一 `.db` 文件，三张表。\n- **驱动**：aiosqlite（异步）。Ledger 接口定义为 async。\n- **三 Store ABC 化**：`OperationLedger`（ABC）→ `SqliteOperationLedger`（实现）；`CheckpointStore`（ABC）→ `SqliteCheckpointStore`；`SessionMetaStore`（ABC）→ `SqliteSessionMetaStore`。PostgreSQL 实现留空（Phase 4 只需 boundary）。\n\n### SQLite Schema（三张表）\n\n**`operations` 表**（Operation Ledger，按 07 §4 最小字段集）：\n```\ntool_call_id TEXT PRIMARY KEY,       -- = operation_id，1:1\nsession_id   TEXT NOT NULL,\nrun_id       TEXT,\nagent_id     TEXT,\ntool_name    TEXT NOT NULL,\nargs_identity TEXT NOT NULL,         -- Tool.args_identity() 输出\nstate        TEXT NOT NULL,          -- PENDING/RUNNING/SUCCEEDED/FAILED/CANCELLED/UNKNOWN/NEED_RECONCILE\nresult_json  TEXT,                    -- 终态时写入 ToolResult 的 JSON\nartifact_ref TEXT,                    -- nullable，Phase 4 不写先留位\nstarted_at   TEXT,\nfinished_at  TEXT,\nreconcile_meta TEXT                   -- reconcile 裁决记录\n```\n\n**`checkpoints` 表**：\n```\nsession_id     TEXT NOT NULL,\nboundary_type  TEXT NOT NULL,         -- USER_ACCEPTED/MODEL_COMPLETED/TOOL_BATCH_COMPLETED/FINAL_COMPLETED\nevent_seq      INTEGER NOT NULL,      -- 对应的 SessionEvent 序号\npayload_json   TEXT,\ncreated_at     TEXT NOT NULL,\nPRIMARY KEY (session_id, boundary_type, event_seq)\n```\n\n**`session_meta` 表**：\n```\nsession_id          TEXT PRIMARY KEY,\ncreated_at          TEXT NOT NULL,\nagent_id            TEXT,\nlast_checkpoint_seq INTEGER,\narchived            BOOLEAN DEFAULT 0\n```\n\n### Ledger-first 崩溃写顺序\n\n```\nexecute() 入口 → Ledger.PENDING\n进入 retry_loop → Ledger.RUNNING\ntool.execute(args) + retry（不写 Ledger，走 Diagnostic Log）\nretry_loop 结束 → Ledger.SUCCEEDED / FAILED / CANCELLED\n→ append tool/call + tool/result SessionEvent\n```\n\n崩溃时 Ledger 比 SessionEvent 更完整 → reconcile 合成缺失的 ToolResult。\n\n### Operation 状态机（07 §4 冻结）\n\n```\nPENDING → RUNNING → SUCCEEDED\n                  → FAILED\n                  → CANCELLED\n崩溃时 RUNNING → UNKNOWN → NEED_RECONCILE\n```\n\n### Reconcile 流程（RecoveryCoordinator 第 5 步）\n\n```\nfor op in ledger.list_unresolved(session_id):\n    if op.state == SUCCEEDED:    → 合成 Recovery ToolResult（用 result_json）\n    elif op.state == FAILED:     → 合成失败 ToolResult\n    elif op.state == CANCELLED:  → 合成取消 ToolResult\n    elif op.state == PENDING:    → PendingPolicy.skip（合成 skipped ToolResult）\n    elif op.state in (UNKNOWN, NEED_RECONCILE):\n        hint = tool.reconcile_hint(op.args, op.state)\n        → 一律走 ReconcileCallback 交用户（即使 hint.verifiable=True）\n        → append operation/reconcile-required SessionEvent\n    所有合成结果复用原始 tool_call_id → session.append(tool/result event)\n```\n\n### CheckpointPolicy seam\n\n```\nclass CheckpointPolicy(ABC):\n    def maybe_save(self, session, boundary_type): ...\n\nclass OnStableBoundary(CheckpointPolicy):  # 默认\n    # 只在 4 个稳定边界写 CheckpointStore\n\nclass NoCheckpoint(CheckpointPolicy):      # 测试用\nclass EveryStep(CheckpointPolicy):         # 测试用\n```\n\nAgentRuntime 在每个边界调 `self._checkpoint_policy.maybe_save(session, boundary_type)`。\n\n### ReconcileCallback\n\n```\nclass ReconcileCallback(ABC):\n    def __call__(self, operation: Operation, hint: ReconcileHint) -> ReconcileVerdict: ...\n    # ReconcileVerdict: CONFIRM_SUCCESS / CONFIRM_FAILURE / RETRY / ABANDON\n\nclass ReconcileHint:\n    verifiable: bool\n    hint: str\n    # Tool ABC 默认 verifiable=False\n```\n\n与 Phase 3 ApprovalCallback 平行——事前授权 vs 事后裁决。默认 None → 拒绝（安全默认，与 Approval 相同姿态）。\n\n### RecoveryCoordinator\n\n```\nclass RecoveryCoordinator:\n    def __init__(self, session_store, workspace_registry, operation_ledger,\n                 reconcile_callback=None, pending_policy=None, checkpoint_policy=None): ...\n\n    async def recover(self, session_id: str) -> Session:\n        # 07 §9 冻结 8 步：\n        # 1. load SessionEvent → Session\n        # 2. load Session-Sandbox mapping → WorkspaceRegistry.get()\n        # 3. ensure Sandbox started\n        # 4. load Operation Ledger → list unresolved\n        # 5. reconcile unresolved ops（上面的流程）\n        # 6. restore tool result / message consistency → session.append 合成 events\n        # 7. rebuild Runtime Context\n        # 8. return Session，交给 AgentRuntime 继续\n        # 自身失败 → 抛异常，不写中间态（幂等重试）\n        # 并发 → BEGIN EXCLUSIVE 锁 session_meta 行\n```\n\n### Tool 层扩展\n\n```\nclass Tool(ABC):\n    # 现有属性省略\n    def args_identity(self, args: dict) -> str:\n        \"\"\"默认：json.dumps(args, sort_keys=True)。Tool 按需覆写。\"\"\"\n        return json.dumps(args, sort_keys=True, ensure_ascii=False)\n\n    def reconcile_hint(self, args: dict, ledger_state: str) -> ReconcileHint:\n        \"\"\"默认：ReconcileHint(verifiable=False)。可验证工具覆写。\"\"\"\n        return ReconcileHint(verifiable=False, hint=\"无法自动验证\")\n```\n\n### execute_batch 失败级联\n\n- Serial 批次（含 MUTATING）里任一工具永久失败（retry 耗尽，Ledger FAILED）→ 中止剩余，记 CANCELLED。\n- Parallel 批次（全 READ_ONLY）→ 单个失败不影响其他。\n\n### 新增 SessionEvent 类型\n\n- `operation/reconcile-required`：RecoveryCoordinator 进 NEED_RECONCILE 时 append。\n- `checkpoint/saved`：不进 SessionEvent。\n- `artifact/created`：Phase 5。\n\n## Testing Decisions\n\n### 测试 seam\n\n**主 seam**：`RecoveryCoordinator.recover(session_id) -> Session`——用户视角的\"崩溃后能恢复吗\"单一入口。\n**辅助 seam**：`ToolExecutor.execute()` Ledger 接线（单元测试 mock ledger 验证写顺序）。\n\n### 分层测试\n\n**底层单元测试**（`tests/tooling/test_ledger_wiring.py`）：\n- mock ledger，验证 execute() 在正确位置调 PENDING / RUNNING / SUCCEEDED / FAILED。\n- 验证 retry 中间失败不写 Ledger。\n- 验证 batch 并行/串行下每个 tool 都有自己的 operation 记录。\n\n**Store 单元测试**（`tests/storage/test_sqlite_ledger.py` 等）：\n- CRUD 验证：insert pending → update running → update succeeded → query unresolved。\n- 并发：两个连接同时写同一 operation → pessimistic 锁生效。\n- schema：三张表字段完整、artifact_ref nullable。\n\n**Tool 扩展测试**：\n- `args_identity()` 默认 vs 覆写。\n- `reconcile_hint()` 默认 vs 可验证工具覆写。\n\n**顶层 kill-test 集成测试**（`tests/recovery/test_kill_scenarios.py`，`@pytest.mark.integration`）：\n每个场景一个独立测试（非参数化），用 kill_hook + 子进程 resume，覆盖 5 个 Gate 场景：\n\n1. **`test_tool_success_crash_before_result_event`**：Tool 执行成功 → Ledger SUCCEEDED → kill_hook 在 append SessionEvent 前 `os._exit(1)` → 新进程 RecoveryCoordinator.recover() → 验证 Recovery ToolResult 合成正确、dangling=0、duplicate side effect=0。\n2. **`test_unknown_bash_not_blind_rerun`**：bash 执行中 → Ledger RUNNING → kill → resume → Ledger 显示 UNKNOWN → 验证不自动重跑、走 ReconcileCallback。\n3. **`test_dangling_tool_call_zero_after_reconcile`**：多 Tool 部分完成 → kill → resume → 验证 derive_messages 后 dangling=0。\n4. **`test_duplicate_side_effect_zero`**：write 成功 → kill → resume → 验证文件只写了一遍（不重复执行 SUCCEEDED operation）。\n5. **`test_pending_operation_skipped`**：Ledger PENDING → kill → resume → 验证合成 skipped ToolResult、不重跑。\n\n### Prior art\n\n- Phase 1 `test_resume_session.py`：已有的 resume 集成测试模式（进程重启 + JSONL 恢复）。\n- Phase 2 `test_coding_tools.py`：batch 调度 + side_effect 分流测试。\n- Phase 3 `test_approval_gate.py`：callback 注入测试模式（可复用于 ReconcileCallback）。\n\n## Out of Scope\n\n- **PostgreSQL 实装**：只定义 ABC boundary，不实现 PostgresLedger / PostgresCheckpointStore。\n- **Artifact Store / MinIO**：Phase 5。Phase 4 只在 `operations` 表留 `artifact_ref` nullable 列。\n- **Ledger 自动 TTL / retention**：只加 `session_meta.archived` 标记 + `cleanup(session_id)` 方法，不自动执行。\n- **Checkpoint 内容压缩 / 增量**：Phase 4 的 checkpoint 只存 event_seq + payload_json，不做增量快照。\n- **Vector Store**：不在 Phase 4。\n- **SessionEvent 迁移到 SQLite**：保持 JSONL。\n- `artifact/created` SessionEvent 类型：Phase 5。\n\n## Further Notes\n\n### 规格冻结 vs 本 spec 新决策\n\n**规格已冻结（07_STORAGE_PERSISTENCE_RECOVERY.md 等）**：Ledger 状态机、reconcile 终态语义、恢复 8 步顺序、4 个 Checkpoint 边界、不变量 #12-14。本 spec 不重新审视这些。\n\n**本 spec 新决策**：存储架构（JSONL + SQLite 分层）、三 Store ABC、Ledger-first 写顺序、CheckpointPolicy seam、ReconcileCallback 独立、aiosqlite、operation_id=tool_call_id、PendingPolicy skip、串行批次失败级联、pessimistic 锁等。详见 ADR-0004。\n\n### 与 Phase 3 的衔接\n\n- Phase 3 的 `WorkspaceRegistry` 已实现恢复顺序第 2-3 步（load mapping → ensure sandbox）。\n- Phase 3 的 `ApprovalCallback` 与本 spec 的 `ReconcileCallback` 平行但不共用。\n- Phase 3 的 `ToolExecutor.execute()` 是 Ledger 接线的注入点。\n\n### 与 Phase 1 的衔接\n\n- Phase 1 的 dangling 检测（合成\"结果未知\"ToolMessage）在 Phase 4 被 Ledger 驱动的 reconcile 升级替代——RecoveryCoordinator 合成的是有数据的 Recovery ToolResult，不是\"结果未知\"占位。\n- Phase 1 的 `SessionEvent` 类型需新增 `operation/reconcile-required`。\n\n### 依赖\n\n- 新增依赖：`aiosqlite`（PyPI）。\n- stdlib：`sqlite3`（aiosqlite 底层用）。\n\n### ADR 引用\n\n- ADR-0004：Storage 分层 — SessionEvent 留 JSONL，Ledger/Checkpoint 用 SQLite（本 spec 的架构决策来源）。\n- ADR-0001：Sandbox 路径边界（Phase 4 不改）。\n- ADR-0002：bash 非零 exit_code = Tool success（Phase 4 不改）。\n- ADR-0003：SessionEvent append-only 事件日志（Phase 4 在其上加新 event 类型）。\n",
+      "closedAt": "2026-09-03T19:50:37Z",
+      "createdAt": "2026-09-03T15:50:10Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 26,
+      "state": "CLOSED",
+      "title": "Phase 4 Spec: Storage + Operation Ledger + Recovery"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n让一次合法 Tool 调用从进入执行域到返回最终结果都具备持久化 Operation 生命周期。SQLite Operation Ledger 必须先于真实副作用记录状态，并在唯一 retry layer 完成后记录终态，使崩溃恢复能够判断调用实际执行到了哪里。\n\n## Acceptance criteria\n\n- [ ] 引入 aiosqlite 运行时依赖，SQLite I/O 不阻塞 event loop。\n- [ ] 定义 Operation、OperationState 和 OperationLedger ABC；提供 SqliteOperationLedger 默认实现。\n- [ ] operations schema 包含 Issue #26 冻结字段，tool_call_id 同时作为 operation_id，artifact_ref 为 nullable 预留列。\n- [ ] Tool 契约提供稳定的 args_identity(args)，默认使用排序 JSON，Unicode 不转义。\n- [ ] ToolExecutor 可注入 Ledger 和执行身份上下文；合法调用按 PENDING → RUNNING → SUCCEEDED/FAILED/CANCELLED 持久化。\n- [ ] Ledger 更新位于 retry loop 外；中间 attempt 失败只进入 Diagnostic Log，不产生额外 Operation。\n- [ ] 每次状态变更独立 commit，N 个 Tool 调用对应 N 个独立 Operation。\n- [ ] Store CRUD、schema、状态转换和 Executor 写入顺序有单元测试；现有测试保持通过。\n\n## Blocked by\n\nNone (can start immediately).",
+      "closedAt": "2026-09-03T16:27:37Z",
+      "createdAt": "2026-09-03T16:06:39Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 27,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket A: Durable Operation lifecycle for one Tool execution"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n让 AgentRuntime 在四个稳定边界保存可恢复 Checkpoint，并通过可替换策略控制保存行为。Checkpoint 是恢复辅助数据，不进入 SessionEvent；Session metadata 与 Operation Ledger 共用同一 SQLite 文件但保持独立 Store contract。\n\n## Acceptance criteria\n\n- [ ] 定义 CheckpointStore 和 SessionMetaStore ABC，并提供各自的 SQLite 默认实现。\n- [ ] checkpoints 与 session_meta schema 符合 Issue #26，三类 SQLite Store 可共享同一数据库文件。\n- [ ] 实现 CheckpointPolicy、OnStableBoundary、NoCheckpoint、EveryStep。\n- [ ] AgentRuntime 在 USER_ACCEPTED、MODEL_COMPLETED、TOOL_BATCH_COMPLETED、FINAL_COMPLETED 四个边界调用 policy。\n- [ ] checkpoint/saved 不写入 SessionEvent。\n- [ ] Session metadata 支持 archived 标记和显式 cleanup；不实现自动 TTL。\n- [ ] PostgreSQL 只由 ABC 形成替换边界，不提供实现。\n- [ ] 四个边界、策略替换、schema 和 cleanup 均有测试；现有测试保持通过。\n\n## Blocked by\n\n- #27 — Ticket A",
+      "closedAt": "2026-09-03T19:50:17Z",
+      "createdAt": "2026-09-03T16:06:42Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 28,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket B: Stable-boundary Checkpoint persistence"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n提供 RecoveryCoordinator.recover(session_id) 单一入口，按冻结的恢复顺序找回 Session、Workspace 和 Ledger 状态。已知终态及 PENDING Operation 必须生成与原 tool_call_id 配对的 Recovery ToolResult，且不能重新执行已确认副作用。\n\n## Acceptance criteria\n\n- [ ] RecoveryCoordinator 按 Issue #26 的 8 步顺序恢复 Session 和 Sandbox。\n- [ ] SUCCEEDED、FAILED、CANCELLED 且缺少结果事件的 Operation 分别合成准确 ToolResult。\n- [ ] PENDING 由可注入 PendingPolicy 处理，默认 skip 并合成 skipped ToolResult，不自动执行。\n- [ ] 所有恢复结果复用原 tool_call_id；恢复后消息投影不存在已处理的 dangling call。\n- [ ] Runtime Context 从恢复后的持久 SessionEvent 重新派生。\n- [ ] 同一 session 的并发恢复由 SQLite pessimistic transaction 串行化；实现不得声称 SQLite 提供行级锁。\n- [ ] 恢复决策先完成再写结果；协调器失败抛出异常且不记录虚假的恢复完成状态，再次调用可安全重试。\n- [ ] 终态、PENDING、Workspace 恢复、并发和幂等行为有测试。\n\n## Blocked by\n\n- #27 — Ticket A\n- #28 — Ticket B",
+      "closedAt": "2026-09-03T19:50:12Z",
+      "createdAt": "2026-09-03T16:06:45Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 29,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket C: Recover terminal and PENDING Operations safely"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n让崩溃时处于 RUNNING 的 Operation 进入 UNKNOWN / NEED_RECONCILE，并通过独立 ReconcileCallback 由用户裁决。即使 Tool 提供可验证建议，也不得自动验证或盲目重跑高风险副作用。\n\n## Acceptance criteria\n\n- [ ] 定义 ReconcileHint、ReconcileVerdict 和独立的 ReconcileCallback contract。\n- [ ] Tool 默认 reconcile_hint 为 unverifiable；read/write/edit/glob/grep/git_status/git_diff 提供 verifiable 建议；bash 保持默认。\n- [ ] RUNNING 崩溃状态进入 UNKNOWN，再进入 NEED_RECONCILE。\n- [ ] UNKNOWN 与 NEED_RECONCILE 始终调用 ReconcileCallback；没有 callback 时安全拒绝。\n- [ ] 支持 CONFIRM_SUCCESS、CONFIRM_FAILURE、RETRY、ABANDON 四种显式裁决，RETRY 只能来自用户裁决。\n- [ ] 进入 NEED_RECONCILE 时追加 operation/reconcile-required SessionEvent；checkpoint/saved 仍不进入事件流。\n- [ ] UNKNOWN bash 永不自动重跑。\n- [ ] 默认安全行为、各 Tool hint、四种 verdict、状态和事件均有测试。\n\n## Blocked by\n\n- #29 — Ticket C",
+      "closedAt": "2026-09-03T19:50:07Z",
+      "createdAt": "2026-09-03T16:06:48Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 30,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket D: Human reconciliation for UNKNOWN Operations"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n为 Tool 批次提供安全失败级联：含写操作的串行批次在一个调用永久失败后停止执行剩余调用并将其明确取消；全 READ_ONLY 并行批次继续独立完成，不让单个失败扩散。\n\n## Acceptance criteria\n\n- [ ] 串行批次中首个永久失败终止后续真实执行。\n- [ ] 未执行的后续调用在 Ledger 中记录为 CANCELLED，并返回配对的取消 ToolResult。\n- [ ] 全 READ_ONLY 并行批次的单个失败不取消或阻止其他调用。\n- [ ] 每个调用使用独立 Operation 和独立事务，结果顺序保持与输入一致。\n- [ ] INVALID_ARGUMENT、PERMISSION_DENIED 等执行前失败的 Ledger 语义明确且不会产生外部副作用。\n- [ ] retry 仍只有 ToolExecutor 一层，批次调度器不增加第二套 retry。\n- [ ] 串行级联、并行隔离、Ledger 状态和 ToolResult 配对有测试。\n\n## Blocked by\n\n- #27 — Ticket A",
+      "closedAt": "2026-09-03T16:54:05Z",
+      "createdAt": "2026-09-03T16:06:51Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 31,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket E: Safe failure cascading for Tool batches"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n使用真实子进程和可注入 kill hook 验证已知终态及 PENDING Operation 的崩溃恢复。新进程恢复后必须保留 Workspace、补齐消息链，并保证已确认的副作用不会执行第二次。\n\n## Acceptance criteria\n\n- [ ] ToolExecutor 提供仅用于精确故障注入的可选 kill_hook，生产默认行为不变。\n- [ ] Tool 成功、Ledger 已写终态、tool/call 已持久化但 result event 未写时可被真实 Kill。\n- [ ] 新进程 recover 后生成正确 Recovery ToolResult，dangling tool call 为零。\n- [ ] write 等已成功副作用在恢复中不重复，duplicate side effect 为零。\n- [ ] PENDING Operation 在恢复中默认 skip，不调用真实 Tool。\n- [ ] 多 Tool 部分完成后崩溃仍能恢复所有已知 Operation，并保持结果配对。\n- [ ] Session Workspace 在新进程中恢复到原映射。\n- [ ] 每个 Kill 场景为独立 integration test，且有超时保护避免测试挂死。\n\n## Blocked by\n\n- #29 — Ticket C\n- #31 — Ticket E",
+      "closedAt": "2026-09-03T19:50:02Z",
+      "createdAt": "2026-09-03T16:06:54Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 32,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket F: Kill and resume terminal or PENDING Operations"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#26 — Phase 4 Spec: Storage + Operation Ledger + Recovery\n\n## What to build\n\n以真实 RUNNING bash 崩溃场景验证 UNKNOWN Operation 不会盲重跑，完成人工 reconcile 后收口 Phase 4 的全部恢复 Gate 和回归验证。\n\n## Acceptance criteria\n\n- [ ] bash 处于 RUNNING 时真实 Kill，恢复后状态为 UNKNOWN / NEED_RECONCILE。\n- [ ] 没有 ReconcileCallback 时 bash 不执行；有 callback 时仅按显式 verdict 继续。\n- [ ] operation/reconcile-required 事件可从持久 SessionEvent 中观察。\n- [ ] 并发 recover 不产生重复 Recovery ToolResult 或重复副作用。\n- [ ] Phase 4 五个独立 Kill 场景全部通过。\n- [ ] 最终 Gate：duplicate confirmed side effect = 0、dangling tool call = 0、Workspace 恢复正确。\n- [ ] 全量 pytest 与 Ruff 通过，并记录 Phase 4 Gate 证据；只有全部通过后才能更新 PHASE_STATUS。\n\n## Blocked by\n\n- #30 — Ticket D\n- #32 — Ticket F",
+      "closedAt": "2026-09-03T19:49:46Z",
+      "createdAt": "2026-09-03T16:06:57Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 33,
+      "state": "CLOSED",
+      "title": "Phase 4 Ticket G: UNKNOWN bash reconciliation and Phase gate"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nprojection.ts 中 \\`step_id ?? active_step_id ?? 1\\` 形态的兜底表达式重复出现 6 处。每处语义相同（持久事件取自身 step_id，流式事件跟随 active_step_id，兜底 1），分散维护容易在新增事件类型时漏改。\n\n## Evidence\n\\`git grep '?? active_step_id ?? 1' web/src/lib/projection.ts\\` 命中多处（2026-09-04 code-review + 交接文档已知债清单）。\n\n## Acceptance criteria\n- [ ] 单一 \\`resolveStepId(event, state)\\` helper，6 处调用点全部替换\n- [ ] 行为零变化（projectHistory 与 applyEvent 输出逐事件一致，用现有 E2E + tsc 验证）\n- [ ] 不改任何投影语义（最小 diff）",
+      "closedAt": "2026-09-04T06:02:15Z",
+      "createdAt": "2026-09-03T19:56:03Z",
+      "labels": [],
+      "number": 34,
+      "state": "CLOSED",
+      "title": "refactor(web): projection.ts 中 step_id 兜底逻辑重复 6 处，抽 resolveStepId helper"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nindex.css 中亮色 token 存在两份：\\`@media (prefers-color-scheme: light) :root\\`（系统偏好兜底，无 JS 时首帧正确）与 \\`:root[data-theme='light']\\`（手动切换）。CSS 原生没有变量组复用机制，修改时必须两处同步（文件内注释已自警）。2026-09-04 已从 3 份收敛到 2 份（删除了冗余 dark 组）。\n\n## Evidence\nindex.css 亮色变量组 ×2。\n\n## Acceptance criteria\n- [ ] 要么接受现状并保留注释（推荐：CSS 无 mixin，收益/风险比不划算），要么用构建期生成收敛\n- [ ] 若收敛：浅色模式视觉回归（截图对比）必须过",
+      "closedAt": null,
+      "createdAt": "2026-09-03T19:56:26Z",
+      "labels": [],
+      "number": 35,
+      "state": "OPEN",
+      "title": "chore(web): 主题亮色变量组双份手工同步（media 查询 + data-theme）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nspec 11 §5 Inspector 右栏规划了 Overview / Trace / Context / Tools / State / Logs。当前 V1 只实现 Overview（label+value）+ Tools 列表 + Checkpoint/Artifact 空槽。Trace/Context/State/Logs 需要 runtime 数据（context token 统计、state 快照、结构化日志 API），数据面不存在。\n\n**Blocking：** 后端 Phase 4/6/7 数据面（artifact/context/checkpoint/operation ledger 查询 API）。前端严禁为它造第二套真相（不变量 #22）。\n\n## Acceptance criteria\n- [ ] 后端提供对应只读查询 API（Backend 会话领域）\n- [ ] 前端按 MASTER.md 克制风渲染（Apple Settings 式 label+value / 克制的 usage bar / JSONL viewer）\n- [ ] 不引入状态库（ADR-0005 冻结）",
+      "closedAt": "2026-09-04T08:47:48Z",
+      "createdAt": "2026-09-03T19:56:29Z",
+      "labels": [],
+      "number": 36,
+      "state": "CLOSED",
+      "title": "feat(web): Inspector Trace/Context/State/Logs 面板（blocked：后端数据源，Phase 4/6/7）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nApprovalCard 组件已写（warning 玻璃 + 批准/拒绝 + POST /approve），V1 后端 auto-approve 走不到。真正交互式审批需要 pending approval queue + 服务端推送（WebSocket seam，见 src/agent_harness/web/app.py 中间件空壳与 approve endpoint 的 202 seam）。\n\n**Blocking：** 后端审批事件流 + POST /approve 实际生效（backend 领域，ADR-0005 Q14）。\n\n## Acceptance criteria\n- [ ] 后端 pending queue + 推送\n- [ ] ApprovalCard 接真实 pending 事件（frontend 消费真值，不造本地队列）\n- [ ] 批准/拒绝回传后工具继续/终止的 E2E",
+      "closedAt": null,
+      "createdAt": "2026-09-03T19:56:31Z",
+      "labels": [],
+      "number": 37,
+      "state": "OPEN",
+      "title": "feat(web): 交互式审批走通（pending approval queue，blocked：WebSocket seam，ADR-0005 Q14 defer）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\n当前前端保障 = Python 契约测试 + tsc + 人工浏览器 E2E。lib/projection.ts（纯函数状态机）、lib/markdown.tsx（解析器）是高价值单测对象，但无前端测试框架。引入 Vitest 是**新 dev dependency**，需确认是否在 ADR-0005 冻结意图内（冻结清单写的是\"无状态管理库/无 CSS 框架/传输层 SSE\"，测试框架未明确列入）。\n\n**需要项目所有者裁决**——不裁决不动（AGENTS.md §9.1：新增规格外基础设施需用户决策）。\n\n## Acceptance criteria\n- [ ] 用户裁决：引入 / 不引入\n- [ ] 若引入：先覆盖 projection.ts（事件折叠语义）与 markdown.tsx（解析边界），纯函数优先",
+      "closedAt": "2026-09-04T05:19:19Z",
+      "createdAt": "2026-09-03T19:57:05Z",
+      "labels": [],
+      "number": 38,
+      "state": "CLOSED",
+      "title": "question(web): 是否引入 Vitest 前端单测框架（ADR-0005 冻结范围外的 stack 决策）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nAgentRuntime 把 _last_result 挂在实例上（runtime.py），供 run() 同步取结果。同一 runtime 实例并发跑两个 run 时互相覆盖。Phase 9/10 web 层每请求新建 runtime（_build_runtime），当前无实际触发路径，但 run_stream 与 run 混用或未来复用 runtime 时会踩。\n\n**归属：backend 领域**（feat/backend 会话），前端不修。记录自交接文档已知债清单 + 2026-09-04 code-review 复核确认仍在。\n\n## Acceptance criteria\n- [ ] _last_result 移入 run() 局部 / 返回值，或 runtime 加并发守卫（backend 会话决定）\n- [ ] 有并发 run 的回归测试",
+      "closedAt": null,
+      "createdAt": "2026-09-03T19:57:07Z",
+      "labels": [],
+      "number": 39,
+      "state": "OPEN",
+      "title": "fix(backend): AgentRuntime._last_result 实例态在并发 run 下有竞态（pre-existing）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\nSessionList 的相对时间在渲染时计算，组件不重渲染就一直显示旧值（挂载 10 分钟后仍显示挂载时的'2 分钟前'）。轻微 UX，不阻塞。\n\n## Acceptance criteria\n- [ ] 方案 A（推荐）：1 分钟一次的轻量 tick 触发重渲染，仅 SessionList 可见时\n- [ ] 方案 B：接受现状（选中/刷新即更新）",
+      "closedAt": "2026-09-04T06:46:00Z",
+      "createdAt": "2026-09-03T19:57:09Z",
+      "labels": [],
+      "number": 40,
+      "state": "CLOSED",
+      "title": "fix(web): SessionList 相对时间（'N 分钟前'）不随时间流逝刷新"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\n架构扫描（2026-09-04）Top 1。三条状态流（列表/历史/流式）在 useSession 交织：submitTask 的 conv 闭包把新流事件折叠进旧会话 state，liveSessionId 流结束才 patch，live/history/temp-id 语义只活在注释里。da8b2ec 的\"切换停流\"是该缺失类型的第一个运行期补丁。\n\n## 方向（grilling 待用户）\nSessionMode = 'idle' | { live: sid } | { viewing: sid } 判别联合进 types.ts；conversation 归属 mode 指向的 sid；切换/新建/流结束的状态迁移进纯 reducer。\n\n## Acceptance criteria\n- [ ] conversation.session_id 与 mode 恒等（编译期保证）\n- [ ] 流式中切换会话的语义由类型驱动（当前是 if (streaming) cancelStream() 补丁）\n- [ ] 现有 E2E + tsc 全过，行为零回退",
+      "closedAt": "2026-09-04T06:59:39Z",
+      "createdAt": "2026-09-03T20:06:02Z",
+      "labels": [],
+      "number": 41,
+      "state": "CLOSED",
+      "title": "refactor(web): useSession 会话模式判别态（idle | live(sid) | viewing(sid)）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\n架构扫描（2026-09-04）Top 1。三条状态流（列表/历史/流式）在 useSession 交织：submitTask 的 conv 闭包把新流事件折叠进旧会话 state，liveSessionId 流结束才 patch，live/history/temp-id 语义只活在注释里。da8b2ec 的切换停流是该缺失类型的第一个运行期补丁。\n\n## 方向（grilling 待用户）\nSessionMode = 'idle' | { live: sid } | { viewing: sid } 判别联合进 types.ts；conversation 归属 mode 指向的 sid；切换/新建/流结束的状态迁移进纯 reducer。\n\n## Acceptance criteria\n- [ ] conversation.session_id 与 mode 恒等（编译期保证）\n- [ ] 流式中切换会话的语义由类型驱动（当前是 if (streaming) cancelStream() 补丁）\n- [ ] 现有 E2E + tsc 全过，行为零回退",
+      "closedAt": "2026-09-04T05:19:16Z",
+      "createdAt": "2026-09-03T20:06:59Z",
+      "labels": [],
+      "number": 42,
+      "state": "CLOSED",
+      "title": "refactor(web): useSession 会话模式判别态（idle | live(sid) | viewing(sid)）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Context\n架构扫描发现 SessionEvent 形状漂移：前端已补 time/event_id 消费（历史重建用事件真值时间，2026-09-04 修复），但 POST /api/sessions 的 SSE 帧（_event_to_sse_dict）不含 time——流式中的 started_at/completed_at 仍是客户端时钟，跨刷新与历史重建不一致。\n\n**Backend 改动**：_event_to_sse_dict 的 durable 事件注入 SessionEvent.time（流式信号 model/delta 可注入发送时刻）。\n\n## Acceptance criteria\n- [ ] 每帧带 time\n- [ ] 前端 projection 已写好 event.time ?? 回退，后端改完即自动生效（前端零改动）\n- [ ] tests/test_web_api.py 每帧 session_id 断言旁加 time 断言",
+      "closedAt": "2026-09-04T08:28:59Z",
+      "createdAt": "2026-09-03T20:07:11Z",
+      "labels": [],
+      "number": 43,
+      "state": "CLOSED",
+      "title": "feat(web): SSE 流式帧注入 time（backend 协作，live/history 时间同源）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Problem Statement\n\n当 Tool 产出大输出（如 bash 跑出 5000 行日志、read 一个大文件），当前实现把完整内容直接灌进 `tool/result` 事件和 derive_messages 投影——模型 context window 被单个工具输出撑爆，后续轮次要么超限报错要么丢失早期重要上下文。没有 Artifact 存储意味着大输出无处安放，没有 Compaction 意味着长对话无法在有限窗口内持续。\n\n## Solution\n\n引入 Artifact Store（七牛云 Kodo S3 兼容）自动溢出大 ToolResult 到对象存储，模型只拿截断摘要 + artifact_ref；引入 ContextBuilder 作为 Runtime loop 的单一 context 入口，内含 token 估算和三层降级 Compaction（LLM 摘要 → 机械提取 → 拒绝），在对话增长时自动压缩早期 turns 为结构化 summary。新增 `inspect_artifact` Tool 让模型按需局部读取 Artifact 细节。\n\n## User Stories\n\n1. 作为 Agent Runtime，我想要 ToolResult 输出超过阈值时自动溢出到对象存储，这样模型 context 不被单个大输出撑爆。\n2. 作为 Agent Runtime，我想要溢出后模型拿到截断摘要 + artifact_ref 而非完整内容，这样模型知道输出存在但不会窗口溢出。\n3. 作为模型，我想要通过 inspect_artifact 工具按行局部读取已溢出的 Artifact，这样我能按需找回大输出的细节。\n4. 作为 Agent Runtime，我想要每轮 loop 开头检测 context token 占用，这样我能在超阈值时自动压缩。\n5. 作为 Agent Runtime，我想要 Compaction 在 auto_compact_threshold (0.70) 时自动触发，这样长对话能在窗口内持续。\n6. 作为 Agent Runtime，我想要 Compaction 优先用 LLM 生成结构化摘要，这样压缩后的 context 保留最多语义信息。\n7. 作为 Agent Runtime，我想要 LLM 摘要失败时走 deterministic 机械提取兜底，这样 compaction 永不因 LLM 故障而完全失败。\n8. 作为 Agent Runtime，我想要机械提取后仍超 hard_guard_threshold (0.85) 时停止 loop，这样不会发送超窗口请求。\n9. 作为 Agent Runtime，我想要 Compaction 以 AIMessage + 其 ToolMessage 块为原子边界，这样不会拆断 tool_call/ToolResult 配对。\n10. 作为开发者，我想要 ArtifactStore 是 ABC 且测试用 FakeArtifactStore，这样我不需要真实七牛云凭证就能跑单元测试。\n11. 作为开发者，我想要 S3ArtifactStore 用 aioboto3 对接七牛云 S3 兼容端点，这样生产部署只用云端对象存储。\n12. 作为开发者，我想要 ContextBuilder 预留 ContextProvider Protocol 扩展点，这样 Phase 6 Memory 能无缝注入。\n13. 作为运维者，我想要 artifact/created 和 context/compacted 进 SessionEvent 流，这样 replay 和 fork 能重建完整语义。\n14. 作为开发者，我想要 tiktoken 做精确 token 估算，这样 Compaction 阈值判断在生产 200K 窗口下足够准确。\n15. 作为开发者，我想要 max_context_tokens / auto_compact_threshold / hard_guard_threshold 都可配置，这样不同模型窗口能适配。\n16. 作为 Agent Runtime，我想要 Compaction 不删除持久化 SessionEvent，这样完整保存 ≠ 完整注入的不变量守住。\n\n## Implementation Decisions\n\n### 模块新建\n\n- **ArtifactStore ABC** (`storage/artifact.py`)：`save(session_id, content, *, mime_type, source_tool, tool_call_id) -> Artifact` / `load(artifact_id) -> Artifact` / `inspect(artifact_id, *, start_line, end_line, keyword, max_lines) -> ArtifactSlice`。Artifact = content-hash 寻址（artifact_id = 内容哈希）。\n- **S3ArtifactStore** (`storage/s3_artifact.py`)：用 `aioboto3` 对接七牛云 Kodo S3 兼容端点。endpoint/bucket/access_key/secret 走 Settings。\n- **FakeArtifactStore** (`storage/artifact.py` 同文件)：内存 dict 实现，给测试用。\n- **ArtifactOverflowHandler** (`tooling/overflow.py`)：实现 `OverflowHandler` 接口。检测 ToolResult 主输出字段字符数是否超阈值，超了就调 ArtifactStore.save + 截断替换 + 返回新 ToolResult（带 artifact_ref）。\n- **ContextBuilder** (`context/builder.py`)：`build(session) -> list[AnyMessage]`。内部调 derive_messages → 估 token → 按需 compact → 返回安全 messages。\n- **estimate_tokens** (`context/tokens.py`)：`tiktoken cl100k_base` 封装。\n- **ContextCompactor** (`context/compactor.py`)：三层降级逻辑。LLM 摘要（用 ModelProvider.ainvoke）→ 机械提取 → ContextWindowExceededError。以 AIMessage 为原子边界。\n- **ContextProvider** (`context/provider.py`)：Protocol 定义（3 行），Phase 5 不实现。\n- **ContextWindowExceededError** (`context/builder.py`)：异常类。\n- **InspectArtifactTool** (`tools/inspect_artifact.py`)：构造注入 ArtifactStore，READ_ONLY，不经 Sandbox。\n\n### 模块修改\n\n- **ToolExecutor** (`tooling/executor.py`)：增加可选 `overflow_handler: OverflowHandler | None`。在 tool.execute 成功返回后、Ledger.update_state 之前调 `overflow_handler.maybe_overflow(session, tool_call_id, tool_name, result)`。\n- **AgentRuntime** (`agent/runtime.py`)：loop 第 1 步从 `session.derive_messages()` 改为 `context_builder.build(session)`。构造函数增加 `context_builder: ContextBuilder` 参数。\n- **SessionEvent** (`session/event.py`)：EVENT_TYPES 增加 `artifact/created` 和 `context/compacted`。\n- **Session.append**：支持 append 新事件类型（已有通用 append，无需改）。\n- **Settings** (`config.py`)：增加 `artifact_store_endpoint` / `artifact_store_bucket` / `artifact_store_access_key` / `artifact_store_secret_key` / `artifact_store_region` / `max_context_tokens` (default 200000) / `auto_compact_threshold` (0.70) / `hard_guard_threshold` (0.85) / `artifact_overflow_chars` (2000)。\n\n### 接口契约\n\n- `OverflowHandler` ABC：`async maybe_overflow(session, tool_call_id, tool_name, result: ToolResult) -> ToolResult`。不溢出时原样返回。\n- 溢出截断格式：前 N 行 + `\"... [truncated, {total} lines total, use inspect_artifact({artifact_id}) to view]\"` + 后 N 行。\n- `context/compacted` 事件 data：`{compacted_turn_count, summary_message_count, token_estimate, fallback_used: bool}`。\n- `artifact/created` 事件 data：`{artifact_id, session_id, source_tool, tool_call_id, size, mime_type}`。\n\n### 依赖\n\n- `tiktoken`：核心依赖（Compaction 是 Core 能力）。\n- `aioboto3`：可选依赖（`optional-dependencies` 下 `artifact` 组）。\n\n## Testing Decisions\n\n### 测试 seam\n\n- **ArtifactStore**：单元测试用 FakeArtifactStore（内存），验证 save/load/inspect 契约。S3ArtifactStore 单元测试 mock aioboto3 client，验证 S3 调用参数。集成测试标 `@pytest.mark.qiniu` 默认 skip。\n- **ArtifactOverflowHandler**：单元测试用 FakeArtifactStore，验证 (a) 未超阈值原样返回 (b) 超阈值后截断 + artifact_ref 正确 (c) artifact/created 事件被 append。\n- **ContextBuilder + Compactor**：单元测试用 FakeModelProvider（已有），验证 (a) 未超阈值直接返回 derive_messages (b) 超 auto 阈值触发 LLM 摘要 (c) LLM 失败走机械提取 (d) 机械提取后超 hard guard 抛异常 (e) AIMessage 原子边界不可拆断。\n- **AgentRuntime 集成**：用 FakeModel 模拟长对话，验证 (a) 大 ToolResult 自动溢出 (b) 多轮后 auto compaction 触发 (c) 持久化 SessionEvent 完整（compaction 不删事件）。\n- **InspectArtifactTool**：单元测试用 FakeArtifactStore，验证按行范围和关键词读取。\n- **estimate_tokens**：单元测试已知文本的 token 数。\n\n### 测试风格\n\n外部行为测试，不测内部实现。已有的测试模式参考：`tests/tooling/test_executor.py`（ToolExecutor 行为）、`tests/agent/test_agent_loop.py`（Runtime loop 行为）、`tests/recovery/test_recovery_coordinator.py`（协调器行为）。\n\n## Out of Scope\n\n- **Phase 6 Memory**：MemoryCapability / MemoryContextProvider / LangMemProvider 全部不做。ContextProvider Protocol 只定义不实现。\n- **MinIO / Local 文件 Provider**：不做。只有 S3ArtifactStore（七牛云）+ FakeArtifactStore。\n- **Artifact 流式读取**：不做。save/load/inspect 都是全量/局部读取。\n- **Tool 显式声明 Artifact**：Tool 不知道 Artifact 的存在，不做。\n- **Compaction 的跨 session 摘要缓存**：每次 compaction 独立计算，不做缓存。\n- **Token 估算的 Claude 原生 tokenizer**：Phase 5 用 tiktoken cl100k_base 近似，未来换。\n\n## Further Notes\n\n- Phase 5 与 Phase 6 (Memory) 的边界：Phase 5 只做 Artifact + Compaction + ContextBuilder。ContextBuilder 预留 ContextProvider Protocol 扩展点（空列表），Phase 6 填 MemoryContextProvider。\n- 七牛云 Kodo S3 兼容端点的具体配置（endpoint URL / bucket name）由用户在 .env 中提供，不在代码里硬编码。\n- tiktoken cl100k_base 对非 OpenAI 模型（Claude / DeepSeek）是 ~10% 近似，偏保守方向（低估意味着提前压缩）。\n- 规格 06 §1-5 + §8-9 是 Phase 5 的依据；§6-7 (Memory) 属于 Phase 6。",
+      "closedAt": "2026-09-04T07:29:50Z",
+      "createdAt": "2026-09-04T05:42:08Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 44,
+      "state": "CLOSED",
+      "title": "Phase 5 Spec — Artifact + Context Compaction"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\nArtifact 的持久化边界和模型侧读取工具。定义 `ArtifactStore` ABC（content-hash 寻址），实现 `FakeArtifactStore`（内存 dict，测试用），实现 `InspectArtifactTool`（第 10 个 Coding Tool，构造注入 ArtifactStore 而非 Sandbox，READ_ONLY）。注册 inspect_artifact 到 ToolRegistry，让 ToolExecutor 能调度它。\n\n端到端：ToolExecutor 里注册 InspectArtifactTool( FakeArtifactStore )，手工存一个 Artifact，模拟模型调用 inspect_artifact 拿回指定行范围的内容。\n\n## Acceptance criteria\n\n- [ ] `ArtifactStore` ABC 定义三个方法：`save(session_id, content, *, mime_type, source_tool, tool_call_id) -> Artifact` / `load(artifact_id) -> Artifact` / `inspect(artifact_id, *, start_line, end_line, keyword, max_lines) -> ArtifactSlice`\n- [ ] `Artifact` 模型：artifact_id (content-hash) / session_id / size / mime_type / source_tool / tool_call_id / created_at / content (load 时填充)\n- [ ] `ArtifactSlice` 模型：artifact_id / lines (list of {line_number, text}) / total_lines / returned_lines / truncated / query\n- [ ] `FakeArtifactStore` 内存实现，通过全部契约测试\n- [ ] `InspectArtifactTool`：构造注入 ArtifactStore，args = {artifact_id, start_line?, end_line?, keyword?, max_lines=200}，返回 ToolResult.success(data={lines, total_lines, ...})\n- [ ] inspect_artifact 注册到 ToolExecutor 可被调度执行\n- [ ] InspectArtifactTool.reconcile_hint 返回 verifiable=True（重读同一个 artifact 比对即可）\n- [ ] 单元测试覆盖：save → load 往返、inspect 按行范围、inspect 按关键词、max_lines 截断\n\n## Blocked by\n\nNone (can start immediately)",
+      "closedAt": "2026-09-04T06:23:51Z",
+      "createdAt": "2026-09-04T05:59:37Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 45,
+      "state": "CLOSED",
+      "title": "#45: ArtifactStore ABC + FakeArtifactStore + inspect_artifact Tool"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\nToken 估算函数和 ContextBuilder 的基础骨架（不含 Compaction 逻辑）。为后续 Compaction ticket 铺好接入点。\n\n`estimate_tokens(text) -> int`：用 tiktoken cl100k_base 精确计数。\n\n`ContextBuilder`：`build(session) -> list[AnyMessage]`。内部调 `session.derive_messages()` 并直接返回（不做后处理）。构造参数包含 `max_context_tokens=200000` / `auto_compact_threshold=0.70` / `hard_guard_threshold=0.85`，但 Phase 5 此 ticket 不使用它们（留给 Compaction ticket）。\n\n`ContextProvider` Protocol：定义 `select(session, token_budget) -> list[AnyMessage]`，不实现。\n\nSettings 增加 `max_context_tokens` / threshold 配置项。\n\n端到端：`ContextBuilder.build(session)` 返回跟 `session.derive_messages()` 完全一样的结果，但内部已经能估算 token 数（日志或断言验证）。\n\n## Acceptance criteria\n\n- [ ] `estimate_tokens(text: str) -> int` 用 tiktoken cl100k_base，对空串返回 0，对已知英文/中文文本返回合理 token 数\n- [ ] `ContextBuilder` 类：`build(session) -> list[AnyMessage]`，内部调 derive_messages 直接返回\n- [ ] ContextBuilder 构造参数：model_provider / max_context_tokens=200000 / auto_compact_threshold=0.70 / hard_guard_threshold=0.85 / context_providers=[]\n- [ ] `ContextProvider` Protocol 定义（3 行），无实现\n- [ ] Settings 增加 max_context_tokens (default 200000) / auto_compact_threshold (0.70) / hard_guard_threshold (0.85)\n- [ ] tiktoken 加入 requirements (核心依赖)\n- [ ] 单元测试：estimate_tokens 已知文本、ContextBuilder.build 返回与 derive_messages 一致\n\n## Blocked by\n\nNone (can start immediately)",
+      "closedAt": "2026-09-04T06:42:25Z",
+      "createdAt": "2026-09-04T05:59:40Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 46,
+      "state": "CLOSED",
+      "title": "#47: estimate_tokens + ContextBuilder base (no Compaction)"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\nToolResult 大输出自动溢出到 ArtifactStore。定义 `OverflowHandler` ABC 和 `ArtifactOverflowHandler` 实现——检测 ToolResult 主输出字段字符数是否超阈值，超了就调 ArtifactStore.save + 截断替换 + 返回带 artifact_ref 的新 ToolResult。集成到 ToolExecutor 的执行路径（tool.execute 成功返回后、Ledger.update_state 之前）。追加 `artifact/created` SessionEvent。\n\n端到端：一个 bash Tool 返回 5000 行 stdout，Executor 自动溢出存到 FakeArtifactStore，Ledger 记录的 result_json 是截断版 + artifact_ref，session 事件流含 artifact/created。\n\n## Acceptance criteria\n\n- [ ] `OverflowHandler` ABC：`async maybe_overflow(session, tool_call_id, tool_name, result: ToolResult) -> ToolResult`，不溢出时原样返回\n- [ ] `ArtifactOverflowHandler`：构造注入 ArtifactStore + overflow_chars 阈值（默认 2000）\n- [ ] 溢出检测逻辑：提取 ToolResult 的主输出字段（data[\"output\"] 或 data[\"content\"] 或 message），字符数超阈值则溢出\n- [ ] 截断格式：前 N 行 + \"... [truncated, {total} lines total, use inspect_artifact({artifact_id}) to view]\" + 后 N 行\n- [ ] 溢出后 ToolResult.artifact_ref 填入 artifact_id\n- [ ] ToolExecutor 增加可选 overflow_handler 参数，在 tool.execute 返回后、Ledger.update_state 之前调用\n- [ ] `artifact/created` 事件加入 EVENT_TYPES，data = {artifact_id, session_id, source_tool, tool_call_id, size, mime_type}\n- [ ] 单元测试：(a) 未超阈值原样返回 (b) 超阈值截断 + artifact_ref 正确 (c) artifact/created 事件 append (d) Ledger result_json 含截断内容\n\n## Blocked by\n\n- #45 (ArtifactStore ABC + FakeArtifactStore)",
+      "closedAt": "2026-09-04T06:50:59Z",
+      "createdAt": "2026-09-04T06:01:08Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 47,
+      "state": "CLOSED",
+      "title": "Artifact Overflow Handler + Executor 集成 + artifact/created 事件"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\nArtifactStore 的生产 Provider——用 aioboto3 对接七牛云 Kodo 的 S3 兼容端点。endpoint / bucket / access_key / secret_key / region 走 Settings 配置。实现 save / load / inspect 三个方法，行为与 FakeArtifactStore 完全一致（替换可验证）。\n\n单元测试 mock aioboto3 client 验证 S3 调用参数（put_object / get_object / 正确的 key 格式）。集成测试标 `@pytest.mark.qiniu` 默认 skip，需要真实七牛凭证才能跑。\n\n端到端：S3ArtifactStore.save → load → inspect 全链路在 mock 下通过；替换 FakeArtifactStore 行为一致。\n\n## Acceptance criteria\n\n- [ ] `S3ArtifactStore` 实现 ArtifactStore ABC，用 aioboto3 的 S3 client\n- [ ] save：put_object 到 bucket，key 格式 = `{session_id}/{artifact_id}`，返回 Artifact 元数据\n- [ ] load：get_object 从 bucket 读回完整内容 + 元数据\n- [ ] inspect：get_object 读回内容后按行/关键词切片（复用 FakeArtifactStore 的切片逻辑或共享工具函数）\n- [ ] Settings 增加 artifact_store_endpoint / bucket / access_key / secret_key / region\n- [ ] aioboto3 加入 optional-dependencies (artifact 组)\n- [ ] 单元测试 mock aioboto3 验证调用参数\n- [ ] 集成测试 @pytest.mark.qiniu 默认 skip\n- [ ] S3ArtifactStore 与 FakeArtifactStore 通过同一套契约测试（替换可验证）\n\n## Blocked by\n\n- #45 (ArtifactStore ABC)",
+      "closedAt": "2026-09-04T06:58:52Z",
+      "createdAt": "2026-09-04T06:01:11Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 48,
+      "state": "CLOSED",
+      "title": "S3ArtifactStore (七牛云 Kodo S3 兼容)"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\nCompaction 的核心逻辑：三层降级链 + AIMessage 原子边界 + context/compacted 事件。ContextBuilder.build 集成 compaction——当 token 估算超 auto_compact_threshold 时触发，超 hard_guard_threshold 且降级失败时抛 ContextWindowExceededError。\n\n三层降级：\n1. LLM 结构化摘要——取早期完整 turns 送给 ModelProvider.ainvoke，产出保留 facts/decisions/constraints/failed_attempts/unresolved/artifact_refs/citations/tool outcomes 的 summary，注入为 SystemMessage\n2. Deterministic 机械提取——HumanMessage 截断保留 / AIMessage 只留 tool_calls / ToolMessage 只留 tool_call_id + 截断 content\n3. ContextWindowExceededError——两层降级后仍超 hard guard 则抛异常\n\nAIMessage(tool_calls=[...]) + 紧跟的 ToolMessage 块为不可分割原子单元。\n\n端到端：构造一个 token 超阈值的 session（多轮对话），ContextBuilder.build() 后返回的 messages 含结构化 summary 且 token 数在 auto 阈值以下；LLM 失败时走机械提取；都失败时抛异常。\n\n## Acceptance criteria\n\n- [ ] `ContextCompactor` 类：接收 messages + token 估算，返回 compacted messages\n- [ ] AIMessage 原子边界：遍历 messages 时识别 \"AIMessage(tool_calls) + 紧跟 ToolMessage 块\" 为一个不可分割单元\n- [ ] 第一层 LLM 摘要：调用 ModelProvider.ainvoke，prompt 要求结构化 summary，产出 SystemMessage 注入头部\n- [ ] 第二层 deterministic fallback：LLM 失败/超时/格式错时机械提取\n- [ ] 第三层 hard guard：两层降级后 token 仍超 hard_guard_threshold 抛 ContextWindowExceededError\n- [ ] `context/compacted` 事件加入 EVENT_TYPES，data = {compacted_turn_count, summary_message_count, token_estimate, fallback_used: bool}\n- [ ] ContextBuilder.build 集成 compaction（检测 → 压缩 → 返回安全 messages）\n- [ ] 单元测试：(a) 未超阈值不压缩 (b) 超 auto 触发 LLM 摘要 (c) LLM 失败走机械提取 (d) 机械提取后仍超 hard guard 抛异常 (e) tool_call/ToolResult 配对不拆断\n\n## Blocked by\n\n- #46 (estimate_tokens + ContextBuilder base)",
+      "closedAt": "2026-09-04T07:09:37Z",
+      "createdAt": "2026-09-04T06:01:48Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 49,
+      "state": "CLOSED",
+      "title": "Context Compactor 三层降级 + context/compacted 事件"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 5 Spec #44\n\n## What to build\n\n把 ContextBuilder 接入 AgentRuntime loop，完成 Phase 5 的端到端闭环。AgentRuntime 构造函数增加 context_builder 参数，loop 第 1 步从 `session.derive_messages()` 改为 `context_builder.build(session)`。\n\n**端到端测试用真实 S3ArtifactStore（七牛云），不用 Fake。** 测试需要真实七牛云凭证（endpoint / bucket / access_key / secret_key），如果缺凭证请向用户索取。\n\n端到端验证：\n1. 大 ToolResult 自动溢出到七牛云对象存储，模型只拿到截断摘要 + artifact_ref\n2. 多轮对话后 auto compaction 触发，早期 turns 被压缩成结构化 summary\n3. inspect_artifact 能从七牛云读回溢出内容的局部细节\n4. 持久化 SessionEvent 完整——compaction 不删除任何事件，artifact/created 和 context/compacted 都在事件流中\n5. 刷新后从 SessionEvent 重建完整语义\n\n## Acceptance criteria\n\n- [ ] AgentRuntime 构造函数增加 `context_builder: ContextBuilder` 参数\n- [ ] AgentRuntime loop 第 1 步改为 `messages = context_builder.build(session)`\n- [ ] 现有 345 测试全部通过（不回归）\n- [ ] 端到端测试：bash 大输出 → 自动溢出到真实七牛云 → inspect_artifact 读回\n- [ ] 端到端测试：多轮对话 → auto compaction 触发 → context/compacted 事件持久化\n- [ ] 端到端测试：SessionEvent 流完整重建（无丢失）\n- [ ] Phase 5 Gate 达成：超大 stdout 不进完整 Context / raw data 可找回 / compaction 不删 SessionEvent\n\n## Blocked by\n\n- #47 (Overflow Handler + Executor 集成)\n- #48 (S3ArtifactStore)\n- #49 (Context Compactor)",
+      "closedAt": "2026-09-04T07:29:47Z",
+      "createdAt": "2026-09-04T06:02:18Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 50,
+      "state": "CLOSED",
+      "title": "AgentRuntime 集成 ContextBuilder + Phase 5 端到端测试"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 第一个 ticket。多租户身份隔离基础设施。\n\n## 交付物\n\n- `IdentityContext` dataclass (frozen=True): `tenant_id: str`, `user_id: str`, `scopes: list[str]`\n- `identity_context_var`: `contextvars.ContextVar[IdentityContext | None]`\n- `get_identity_context() -> IdentityContext`: 读 contextvar，未设置时返回默认值 `(local, local)`\n- `web/app.py` 的 `auth_seam` 实现：解析 JWT（可选）→ 创建 IdentityContext → 设进 contextvar\n- config 新增 `jwt_secret: str | None = None`（可选，无则用 local 默认值）\n\n## 测试\n\n- contextvar 设置后子任务可读\n- 未设 contextvar 时默认值正确\n- auth_seam 设置后 MemoryStore 可读到 identity（集成验证）\n\n## 依赖\n\n无前置依赖。这是 Phase 6 的第一个 ticket。\n\n## 约束\n\n- Runtime 签名零侵入（不改 run/run_stream 签名）\n- 身份不进 SessionEvent（请求级 vs 持久级分离）\n\n## 参考\n\n- ADR-0009: 多租户身份隔离\n- CONTEXT.md: IdentityContext",
+      "closedAt": "2026-09-04T14:05:58Z",
+      "createdAt": "2026-09-04T12:27:11Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 51,
+      "state": "CLOSED",
+      "title": "Phase 6 #1: IdentityContext + middleware + contextvar 基础设施"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 ticket #2. 详细描述见 docs/HANDOFF_PHASE6.md",
+      "closedAt": "2026-09-04T14:06:02Z",
+      "createdAt": "2026-09-04T12:27:30Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 52,
+      "state": "CLOSED",
+      "title": "Phase 6 #2:  MemoryScope + MemoryEntry + MemoryRecordStore (SQLite 实现)"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 ticket #3. 详细描述见 docs/HANDOFF_PHASE6.md",
+      "closedAt": "2026-09-04T14:06:06Z",
+      "createdAt": "2026-09-04T12:27:33Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 53,
+      "state": "CLOSED",
+      "title": "Phase 6 #3:  VectorIndexStore (Milvus 实现) + Outbox relay"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 ticket #4. 详细描述见 docs/HANDOFF_PHASE6.md",
+      "closedAt": "2026-09-04T14:06:09Z",
+      "createdAt": "2026-09-04T12:27:36Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 54,
+      "state": "CLOSED",
+      "title": "Phase 6 #4:  MemoryCapability Protocol + MemoryExtractor (LLM + 启发式两层降级) + LangMem BaseStore 适配"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 ticket #5. 详细描述见 docs/HANDOFF_PHASE6.md",
+      "closedAt": "2026-09-04T14:06:13Z",
+      "createdAt": "2026-09-04T12:27:39Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 55,
+      "state": "CLOSED",
+      "title": "Phase 6 #5:  MemoryContextProvider (select + budget 协商 + SystemMessage 注入) + memory/degraded 事件"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "Phase 6 ticket #6. 详细描述见 docs/HANDOFF_PHASE6.md",
+      "closedAt": null,
+      "createdAt": "2026-09-04T12:27:42Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzwQTyg",
+          "name": "phase-6",
+          "description": "Phase 6: Memory Capability / Context Provider",
+          "color": "6C3FC7"
+        }
+      ],
+      "number": 56,
+      "state": "OPEN",
+      "title": "Phase 6 #6:  端到端集成测试 (真实 Zilliz Cloud Milvus)"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\nPhase 7 — Capability / Plugin Foundation + Skills（spec 14）\n\n## What to build\n\n把 Phase 6 的点对点 Capability seam（MemoryCapability → LangMem → MemoryContextProvider）泛化为通用机制：capability registry + provider descriptors + plugin config + SKILL.md discovery + progressive disclosure + Context injection（spec 14 Phase 7 交付清单）。使未来新增领域能力（Finance 等）不修改 Agent Core（spec 08 §1/§8）。\n\n工程依据：spec 08 全文、spec 09 §2（Skills）、13 §2/§3/§5（Pi/DSH PORT DESIGN + Registry BUILD）、ADR-0010、ADR-0011、CONTEXT.md Phase 7 术语。\n\n## Acceptance criteria（Phase 7 Gate，spec 14）\n\n- [ ] 新增 demo capability 不改 Agent Loop（agent/runtime.py 零改动）\n- [ ] Skill 全文不默认永久进 Context（默认只有目录，全文按需 load）\n- [ ] spec 08 §9 验收：切换 Memory Provider 不改 Core；Provider 不支持能力时明确报错；Optional Provider 故障可降级；插件不能绕过 Tool Permission / Operation Ledger\n- [ ] 全量测试绿 + ruff clean\n\n## Blocked by\n\nNone（Phase 6 已收口）。\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:06:45Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 57,
+      "state": "OPEN",
+      "title": "Phase 7 Spec: Capability / Plugin Foundation + Skills"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#57 — Phase 7 Spec: Capability / Plugin Foundation + Skills\n\n## What to build\n\n任何 Capability Provider 都能以\"descriptor + 实例\"注册进一个命名 Registry；Consumer 按名取用，缺失/不支持/停用三种失败各自得到明确的 `CapabilityError`，OPTIONAL 消费者走 `optional()` 拿 None 降级。这是 spec 08 §2/§3/§5/§7 的最小完整实现（ADR-0010 Q1-Q3）。\n\n## Acceptance criteria\n\n- [ ] `CapabilityDescriptor` 字段齐 spec 08 §5 清单（name/version/provider_name/capabilities[]/risk/supports_streaming/supports_recovery/supports_concurrency/config_schema）+ `degradation` 三分类 + `enabled`；`supports(sub)` 判定子能力\n- [ ] `CapabilityError` 四码：not_found / unsupported / disabled / init_failed（ADR-0010 Q3）\n- [ ] `CapabilityRegistry.register(descriptor, provider)`：重复同名注册抛错不覆盖\n- [ ] `get(name)` 缺失抛 not_found；`optional(name)` 缺失返回 None；`descriptor(name)`；`available()` 列已注册 descriptor\n- [ ] disabled 的 provider：`get` 抛 disabled，`optional` 返回 None\n- [ ] 测试位置 tests/capability/，全量套保持绿\n\n## Blocked by\n\nNone (can start immediately).\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:07:05Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 58,
+      "state": "OPEN",
+      "title": "Phase 7 T1: Capability seam 核心 — Descriptor / Error / Registry"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#57 — Phase 7 Spec: Capability / Plugin Foundation + Skills\n\n## What to build\n\n`CAPABILITIES` 环境变量（JSON）解析为类型化配置；`wire_capabilities()` 按 config 驱动 builtin factory 注册进 Registry 并把能力贡献接到 ToolRegistry / ContextProviders。Memory 装配从 Web `_build_runtime` 的直接 import 迁到 factory——**换 Memory Provider 只改配置，不改 Core/装配代码**（spec 08 §9 验收 1；ADR-0010 Q4/Q5/Q6）。\n\n## Acceptance criteria\n\n- [ ] Settings 增 `CAPABILITIES`（默认空串=空 map）；JSON 非法时明确报错，不静默吞\n- [ ] `CapabilityConfigMap`：`{name: {provider, enabled, options}}`，经 Pydantic 校验\n- [ ] builtin factory `memory`：配置齐（milvus+embedding）→ LangMemMemoryCapability（迁 Phase 6 Web 装配逻辑）；配置不齐 → 不注册（optional 路径，Web 行为与现状一致）\n- [ ] `wire_capabilities(registry, config, *, tool_registry, context_providers)`：显式接线\n- [ ] Web `_build_runtime` 改走 registry；无配置时行为与 Phase 6 收口态完全一致（现有测试不破）\n- [ ] 测试：config 解析、factory 缺配置跳过、wire 后 registry 可查、Web 回归\n\n## Blocked by\n\n- #58（T1: Capability seam 核心）\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:07:07Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 59,
+      "state": "OPEN",
+      "title": "Phase 7 T2: Plugin Config + wire_capabilities + Memory 走 Registry"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#57 — Phase 7 Spec: Capability / Plugin Foundation + Skills\n\n## What to build\n\n给定有序 skill 目录列表 + 手动指定路径，发现并解析 `skills/<name>/SKILL.md`（YAML frontmatter 必填 name/description + Markdown 正文），产出 SkillCatalog 与显式解析错误列表。路径越界拒绝；只扫一层；同名先到先得（spec 09 §2 V1 全部四条；ADR-0011 Q1/Q2/Q4）。\n\n## Acceptance criteria\n\n- [ ] frontmatter `---` 围栏切分 + `yaml.safe_load`；缺 name/description 记为解析错误（不中断发现）\n- [ ] `SkillCatalogEntry`：name / description / source_path / body 延迟读取（发现阶段不读全文——渐进披露的物理前提）\n- [ ] 全局目录（Settings `skill_global_dir`，默认 `~/.intelligence-agent/skills/`）+ 项目目录（workspace `skills/`）+ 手动路径三类来源\n- [ ] 同名 skill 先到先得且冲突可见；解析失败列表可观察不静默\n- [ ] 路径边界：解析出的路径必须落在声明目录内（resolve + 前缀校验），越界记错误\n- [ ] 目录不存在 → 空 catalog，不是错误（OPTIONAL 语义）\n- [ ] 测试用 tmp_path 构造 skill 目录，全量套不依赖真实 home\n\n## Blocked by\n\nNone (can start immediately).\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:07:28Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 60,
+      "state": "OPEN",
+      "title": "Phase 7 T3: SKILL.md 解析 + 目录发现"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#57 — Phase 7 Spec: Capability / Plugin Foundation + Skills\n\n## What to build\n\nSkill 全链路：SkillCapability 注册进 Registry（OPTIONAL_RUNTIME）→ `SkillCatalogContextProvider` 把目录（仅 name+description，\"数据非指令\"框架）预算内注入 Context → `load_skill` Tool 走统一 ToolExecutor 返回全文 → 全文不出现在默认注入中（spec 09 §2 流程闭环；ADR-0011 Q3/Q5；Gate 2）。\n\n## Acceptance criteria\n\n- [ ] `SkillCapability`（catalog()/load(name)）注册 descriptor：degradation=OPTIONAL_RUNTIME，supports_recovery=False，supports_concurrency=True，supports_streaming=False\n- [ ] `SkillCatalogContextProvider`：每条一行 `- name: description`，单条 SystemMessage，token 预算内截断；无 skill → 空列表；注入含\"数据非指令\"框架行\n- [ ] `load_skill`：READ_ONLY 工具，参数 name；命中返回全文（前缀防注入声明）；未知名 → 明确失败，不伪造内容\n- [ ] Registry 缺 skills 能力时装配跳过两个 Consumer（optional() 路径）\n- [ ] **Gate 2 断言**：默认 context provider 输出不含任何 skill 正文片段；全文只在 load_skill 结果中出现\n- [ ] 测试：provider select 预算/空态、tool 命中/未知名、runtime 级默认注入只有目录\n\n## Blocked by\n\n- #58（T1: Capability seam 核心）\n- #60（T3: SKILL.md 解析 + 目录发现）\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:07:31Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 61,
+      "state": "OPEN",
+      "title": "Phase 7 T4: SkillCapability + 目录注入 + load_skill（渐进披露闭环）"
+    },
+    {
+      "assignees": [],
+      "author": {
+        "id": "U_kgDOBtvkFg",
+        "is_bot": false,
+        "login": "EricKingWhy",
+        "name": "EricWong"
+      },
+      "body": "## Parent\n\n#57 — Phase 7 Spec: Capability / Plugin Foundation + Skills\n\n## What to build\n\nPhase 7 Gate 的实证切片：一个纯配置注册的 demo capability（`TickerCapability`，贡献一个 `tick` 工具），从 config 到 ToolExecutor 全链路走通且 **AgentRuntime / Agent Loop 零改动**；Web 装配消费 Registry（memory + skills + demo 三能力共存）；可选能力缺失降级实证（spec 08 §8 + 14 Gate 两条）。\n\n## Acceptance criteria\n\n- [ ] `TickerCapability`：descriptor（OPTIONAL_RUNTIME）+ 贡献 `tick` Tool（READ_ONLY，实现 ContributesTools Protocol）；仅在 config 显式启用时注册\n- [ ] **Gate 1 断言**：demo capability 全链路不触碰 agent/runtime.py；Agent 用 ScriptedModel 调 tick 成功回填\n- [ ] Web `_build_runtime` 走 wire_capabilities：memory（有配置）/ skills / demo 三能力共存装配\n- [ ] 降级实证：config 不含某能力 / provider 构造失败 → `optional()` None → 装配跳过 → Runtime 正常（08 §7）\n- [ ] 集成测试 tests/capability/test_phase7_gate.py：ScriptedModel + demo tool 执行闭环 + skills 目录注入 + 默认上下文无 skill 全文\n- [ ] 全量套绿 + ruff clean\n\n## Blocked by\n\n- #59（T2: Plugin Config + wire_capabilities）\n- #61（T4: SkillCapability + 渐进披露闭环）\n",
+      "closedAt": null,
+      "createdAt": "2026-09-04T18:07:57Z",
+      "labels": [
+        {
+          "id": "LA_kwDOT2YvEM8AAAACzhc-Iw",
+          "name": "ready-for-agent",
+          "description": "",
+          "color": "0e8a16"
+        }
+      ],
+      "number": 62,
+      "state": "OPEN",
+      "title": "Phase 7 T5: demo capability + Web 接线 + Phase 7 Gate 集成"
+    }
+  ]
+}

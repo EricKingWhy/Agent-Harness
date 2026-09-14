@@ -1,0 +1,49 @@
+# 密钥与本地环境
+.env
+# 集成/排查时对 .env 做的备份（`.env.bak-integration` 这类）：内容与 .env 同源，
+# 一个 `git add -A` 就会把环境变量提交进仓库，故与 .env 同规则。
+.env.bak*
+.venv/
+
+# 运行时产物（日志、工作区）
+.agent/
+logs/
+
+# 测试运行产物（playwright 上次运行状态 / real-model smoke 会话 JSONL）
+test-results/
+evaluation/smoke_sessions/
+
+# demo/live_agent.py 运行时产物（本地 workspace + SessionEvent JSONL）
+_demo_workspace/
+_demo_sessions/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+
+# Claude Code 工具链（技能定义、本地会话状态——属工具链，非项目代码）
+.claude/
+
+# Karpathy understand skills 产物（本地知识图谱，不提交）
+.understand-anything/
+
+# ZCode 本地会话状态（属工具链，非项目代码）
+.zcode/
+
+# Codex CLI 本地配置（MCP servers 等——属工具链，非项目代码）
+.codex/
+.workbuddy/
+
+# 根目录不应有 JS 依赖（前端依赖在 web/node_modules）
+node_modules/
+
+# 临时剖析/调试产物（diagnosing-bugs harness 等），永不入库
+.scratch/
+
+# Eval 运行报告（本地 JSON 报告是运行产物；数据集真相源在 evaluation/datasets/ 入库）
+evaluation/reports/*.json

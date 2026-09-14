@@ -1,0 +1,367 @@
+/**
+ * Agent Harness Inspector — Design System Tokens
+ * Source of truth: design-system/agent-harness-inspector/MASTER.md + docs/UI_DESIGN_DECISIONS.md (frozen)
+ * Conflict rule: ADR-0005 (architecture) > MASTER.md (visual) > UI_DESIGN_DECISIONS.md (this redesign).
+ *
+ * Phase 1 redesign principles (frozen):
+ *  - Dark-first. Light theme kept in sync via [data-theme] only (JS sets it before paint —
+ *    no @media duplication, no drift risk).
+ *  - Low-contrast chrome, high-clarity content: panels are solid surfaces separated by
+ *    tone + 1px border, NOT floating glass cards.
+ *  - Glass is reserved for floating/control surfaces only (composer, future command palette,
+ *    popovers). Information-dense surfaces stay solid.
+ *  - Radius hierarchy: xs 4 / sm 6 / md 8 / lg 12 (floating) / xl (command palette only).
+ *  - Shadow hierarchy: 2 levels (overlay / popover). Main panels carry no shadow.
+ *  - Ambient background light kept but halved (user decision: 减淡保留一点氛围).
+ */
+
+/* 字体自托管（fontsource variable，2026-09-05 方案 A）：替换原 Google Fonts
+ * @import——CSP `default-src 'self'`（后端 df4f7d8 批加固）会拦截第三方样式表
+ * 与字体，fontsource 经 Vite 打包为同源哈希资源，font-src 'self' 天然满足。
+ * 可变字体覆盖原 400/450/500/600/700 全部字重（wght 100-900）。 */
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
+
+:root {
+  /* ── Fonts ── */
+  --font-ui: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', 'SF Mono', 'Cascadia Code', ui-monospace, monospace;
+
+  /* ── Type scale (dev-tool density) ── */
+  --text-xs: 12px;  /* UI-02（PRD D3）：可读文本地板 11→12px；10px 仅限全大写 micro-label */
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 28px;
+
+  /* ── Spacing (PRD §18.1: 4/8/12/16/20/24/32/40) ── */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-lg2: 20px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+  --space-3xl: 40px;
+
+  /* ── Radii (semantic hierarchy; no giant rounding; PRD §18.2) ── */
+  --radius-xs: 4px;   /* chips / tags */
+  --radius-sm: 6px;   /* inputs / compact controls */
+  --radius-md: 8px;   /* cards / embedded blocks / segmented items */
+  --radius-lg: 12px;  /* popovers / floating composer / user prompt */
+  --radius-xl: 20px;  /* command palette (PRD §18.2: 18-22) */
+  --radius-full: 9999px;
+
+  /* ── Icon system (Tabler/PatternFly informed) ──
+   *  三档尺寸：sm 行内密集 / md 默认按钮 / lg logo 空态。
+   *  Stroke 随尺寸降档——小图标细线更精致（lucide 默认 2px 在 14px 下偏粗）。 */
+  --icon-sm: 14px;
+  --icon-md: 16px;
+  --icon-lg: 20px;
+  --icon-stroke-sm: 1.5px;
+  --icon-stroke-md: 1.75px;
+  --icon-stroke-lg: 2px;
+
+  /* ── Liquid Glass (floating surfaces ONLY) ── */
+  --glass-blur-1: 20px;
+  --glass-blur-2: 40px;
+  --glass-saturate: 1.6;
+  --glass-brightness: 1.05;
+  --glass-border: 0.5px solid rgba(255, 255, 255, 0.1);
+  --glass-border-light: 0.5px solid rgba(0, 0, 0, 0.06);
+  --glass-highlight: inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
+
+  /* ── Shadows: 2 levels, floating surfaces only ── */
+  --shadow-overlay: 0 2px 8px rgba(0, 0, 0, 0.25);
+  --shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.42);
+
+  /* ── Motion (PRD §19 P0: inspector 220-280 / inline expand 160-220 /
+   *    pulse 600-900 / palette 120-180) ── */
+  --ease-apple: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 150ms;
+  --dur-in: 240ms;      /* inspector 展开/收起（PRD 220-280） */
+  --dur-out: 150ms;
+  --dur-expand: 180ms;  /* event inline expand / todo expand（PRD 160-220） */
+  --dur-palette: 150ms; /* command palette（PRD 120-180） */
+  --dur-pulse: 750ms;   /* selected event highlight（PRD 600-900） */
+
+  /* ── 终端内嵌块（bash 输出 / diff 双栏 / 代码块 / 参数回显） ──
+   * 刻意跨主题恒定深底浅字（dev tool 惯例，终端即"内容里的另一块屏幕"，
+   * 不随主题翻转），因此只定义一份、不进主题变量组。 */
+  --terminal-bg: #0d0d0f;
+  --terminal-fg: #d4d4d4;
+  --terminal-muted: #a1a1a6;
+
+  /* ══ Dark theme (default) — SDD 02 §4.1 semantic surface model ══
+   * Observable Agent Workspace redesign (feat/frontend-c, Phase 1):
+   * primary tokens are the SDD §3/§4.1 semantic surfaces; the older
+   * --bg-* / --surface-N names are kept as aliases so app.css keeps
+   * working unchanged. Pink accent per frozen decision 08 #14. */
+  --surface-canvas:    #0c0c0f;   /* app frame / ambient backdrop */
+  --surface-chrome:    #101014;   /* app bar / rails / inspector (quieter) */
+  --surface-workspace: #121217;   /* primary content area (brightest) */
+  --surface-elevated:  #17171d;   /* inset cards, terminal blocks base */
+  --surface-overlay:   #262b34;   /* popovers / floating controls */
+  --surface-glass:     rgba(38, 43, 52, 0.72); /* translucent overlays */
+  --surface-selected:  rgba(245, 174, 201, 0.08); /* pink-tinted selection */
+  --surface-hover:     rgba(255, 255, 255, 0.045);
+  --surface-danger:    rgba(229, 114, 111, 0.10);
+
+  /* Legacy surface aliases (app.css pre-Phase-2 references; mapped onto the
+   * new semantic model so existing selectors resolve unchanged). */
+  --bg-app:       var(--surface-canvas);
+  --bg-sidebar:   var(--surface-chrome);
+  --bg-workspace: var(--surface-workspace);
+  --bg-inspector: var(--surface-chrome);
+  --surface-1:    var(--surface-elevated);
+  --surface-2:    #1f232b;
+
+  /* Borders */
+  --border-subtle: rgba(255, 255, 255, 0.075);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  /* Text: primary > secondary > tertiary (SDD 02 §4.1)
+   * UI-02（PRD D3/R3）：tertiary 0.42→0.52——暗色实测 3.96-4.09:1 不达 AA，
+   * 提档后 ≈4.9:1。禁止低于 4.5:1（两主题实测纪律）。 */
+  --text-primary:   rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.64);
+  --text-tertiary:  rgba(255, 255, 255, 0.52);
+
+  /* Accent: restrained pale pink signature (frozen decision 08 #14, SDD 02 §4.1).
+   * Not AI purple, not the prior cool cyan — the product's own quiet tint. */
+  --accent:        #f1b3ca;
+  --accent-strong: #f4a5c4;
+  --accent-soft:   rgba(241, 179, 202, 0.12);
+  --accent-muted:  var(--accent-soft); /* legacy alias used across app.css */
+
+  /* Status colors (small-area use only: dots, badges, labels) */
+  --success: #6fce9e;
+  --warning: #e3b565;
+  --danger: #e5726f;
+  --info: #7c9eff;
+
+  /* State tint for hover / selected washes */
+  --color-hover: var(--surface-hover);
+
+  /* Edge lighting for floating glass only */
+  --edge-light: inset 0 0.5px 0 rgba(255, 255, 255, 0.14), inset 0 0 0 0.5px rgba(255, 255, 255, 0.04);
+
+/* ── Legacy aliases (app.css pre-Phase-2 references; do not use in new code) ── */
+  --color-background: var(--bg-app);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-overlay);
+  --color-foreground: var(--text-primary);
+  --color-muted-foreground: var(--text-secondary);
+  --color-subtle-foreground: var(--text-tertiary);
+  --color-accent: var(--accent);
+  --color-accent-secondary: var(--success);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-destructive: var(--danger);
+  --color-border: var(--border-subtle);
+  --color-ring: var(--accent);
+
+  /* JsonTree 语法着色（Inspector 结构化查看器） */
+  --json-string: #7ec699;
+  --json-number: #6cb6ff;
+  --json-literal: #d2a8ff;
+  color-scheme: dark;
+}
+
+/* ══ Light theme — equal priority (SDD 02 §4.2), JS sets data-theme before paint ══
+ *
+ * ⚠ 亮色变量维护纪律（Ticket #35）：
+ * 亮色 token 只在此块定义——没有 @media (prefers-color-scheme: light) 兜底。
+ * 修改暗色 :root 中的某个 token 时，必须检查此块是否也需要同步覆盖。
+ * 遗漏亮色覆盖 → 该 token 在亮色模式下仍用暗色值（对比度/可见性问题）。
+ * 新增 token 时在两个块都加定义，或确认亮色可安全继承暗色值。 */
+:root[data-theme='light'] {
+  --surface-canvas:    #f6f6f8;
+  --surface-chrome:    #f1f1f4;
+  --surface-workspace: #fbfbfc;
+  --surface-elevated:  #ffffff;
+  --surface-overlay:   #ffffff;
+  --surface-glass:     rgba(255, 255, 255, 0.78);
+  --surface-selected:  rgba(207, 91, 139, 0.07);
+  --surface-hover:     rgba(20, 20, 28, 0.04);
+  --surface-danger:    rgba(207, 74, 70, 0.08);
+
+  /* Legacy aliases onto the new semantic model. */
+  --bg-app:       var(--surface-canvas);
+  --bg-sidebar:   var(--surface-chrome);
+  --bg-workspace: var(--surface-workspace);
+  --bg-inspector: var(--surface-chrome);
+  --surface-1:    var(--surface-elevated);
+  --surface-2:    #f1f1f3;
+
+  --border-subtle: rgba(18, 18, 24, 0.08);
+  --border-strong: rgba(18, 18, 24, 0.14);
+
+  --text-primary:   rgba(18, 18, 24, 0.92);
+  --text-secondary: rgba(18, 18, 24, 0.62);
+  /* UI-02（PRD D3/R3）：0.42→0.63。实测纪律：0.55 在白底只有 4.12:1、0.60 在
+   * 粉色选中染底上 4.46:1，均不达 AA——估算让位实测；0.63 → 白底 ≈5.4、染底 ≈5.0。 */
+  --text-tertiary:  rgba(18, 18, 24, 0.63);
+
+  --accent:        #c96990;
+  --accent-strong: #b95680;
+  --accent-soft:   rgba(201, 105, 144, 0.10);
+  --accent-muted:  var(--accent-soft);
+
+  --success: #2f9e63;
+  --warning: #b07a10;
+  --danger: #cf4a46;
+  --info: #4a6fd6;
+
+  --color-hover: var(--surface-hover);
+
+  --json-string: #0a7d32;
+  --json-number: #0550ae;
+  --json-literal: #8250df;
+
+  --glass-border: var(--glass-border-light);
+  --edge-light: inset 0 0.5px 0 rgba(255, 255, 255, 0.85), inset 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --shadow-overlay: 0 2px 8px rgba(0, 0, 0, 0.08);
+  --shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.14);
+
+  color-scheme: light;
+}
+
+/* ── Reset / base ── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  color: var(--text-primary);
+  /* Ambient background：环境光减半保留（冻结决策 B 衍生：减淡保留一点氛围） */
+  background:
+    radial-gradient(1100px 720px at 18% -8%, color-mix(in srgb, var(--accent) 3.5%, transparent), transparent 62%),
+    radial-gradient(920px 640px at 88% 108%, color-mix(in srgb, var(--success) 2.5%, transparent), transparent 60%),
+    var(--bg-app);
+  background-attachment: fixed;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden; /* app shell owns scroll */
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Panel surfaces: SOLID (tone + 1px border, no blur, no shadow) ──
+ * Phase 1 材质修正：主面板从浮动玻璃卡降级为实心表面（Linear 式亮度分层）。 */
+.surface-panel {
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+}
+
+/* ── Glass tiers：仅浮层可用（composer / popover / palette） ── */
+.glass {
+  background: var(--surface-overlay);
+  backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate)) brightness(var(--glass-brightness));
+  -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate)) brightness(var(--glass-brightness));
+  border: var(--glass-border);
+  box-shadow: var(--glass-highlight), var(--shadow-overlay);
+}
+
+.surface-floating {
+  background: var(--surface-overlay);
+  backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate)) brightness(var(--glass-brightness));
+  -webkit-backdrop-filter: blur(var(--glass-blur-2)) saturate(var(--glass-saturate)) brightness(var(--glass-brightness));
+  border: var(--glass-border);
+  box-shadow: var(--edge-light), var(--shadow-popover);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass,
+  .surface-floating {
+    background: var(--surface-1);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .surface-floating {
+    backdrop-filter: none;
+    background: var(--surface-1);
+  }
+}
+
+/* 数字对齐：事件数、duration、token 计数一律 tabular-nums */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 文本选择：accent 淡染（细节质感，替代浏览器默认蓝） */
+::selection {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--text-primary);
+}
+
+/* 键盘焦点 */
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+
+/* 运行呼吸：仅用于"活着"的状态表达，禁止滥用 */
+@keyframes breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(1.12); }
+}
+
+/* 选中事件高亮 pulse（Main↔Inspector 联动，PRD §9.2：600-900ms fade，
+ * 克制不夸张；--dur-pulse 控制时长） */
+@keyframes event-pulse {
+  0% { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  100% { background: transparent; }
+}
+
+/* ── Scrollbars (subtle) ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-subtle) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: var(--radius-full);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── Motion safety ── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

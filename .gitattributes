@@ -1,0 +1,14 @@
+# 行尾策略（最小化，只钉住必须为 LF 的类型）
+#
+# 背景：Windows 上 core.autocrlf=true，检出时会把文本转 CRLF。
+# 这对 .sh 脚本是致命的——Git Bash 下执行会报
+#   bash: ./scripts/foo.sh: /usr/bin/env: bad interpreter: No such file or directory
+# （实为 shebang 行尾的 ^M 导致）。
+#
+# 约定：
+#   - shell 脚本一律 LF（入库与检出都不转换）
+#   - PowerShell 脚本一律 CRLF（Windows 原生工具链预期）
+#   - 其余文件沿用 git 默认行为，不做仓库级行尾改动
+
+*.sh text eol=lf
+*.ps1 text eol=crlf

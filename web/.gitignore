@@ -1,0 +1,32 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Playwright artifacts（T8 #101）
+test-results
+playwright-report
+tmp-shots
+
+# 真机浏览器验收截图（本地证据，不进版本库：二进制、体积大，且随时可重跑）
+gui-test-screenshots
